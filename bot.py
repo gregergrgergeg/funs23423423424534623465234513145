@@ -2,8 +2,8 @@
 # -*- coding: utf-8 -*-
 """
 Discord Bot for Epic Games Authentication with true, indefinite session refresh
-using refresh tokens.
-- Last Updated: 2025-11-20 10:00:00
+using refresh tokens. Corrected for missing 'refresh_expires_in' key.
+- Last Updated: 2025-11-20 10:15:00
 """
 
 # --- SETUP AND INSTALLATION ---
@@ -394,7 +394,6 @@ async def monitor_epic_auth(device_code, interval, expires_in, user_ip):
                             'access_token': token_resp['access_token'],
                             'access_token_expires_at': time.time() + token_resp['expires_in'],
                             'refresh_token': token_resp['refresh_token'],
-                            'refresh_token_expires_at': time.time() + token_resp['refresh_expires_in'],
                             'account_info': account_info,
                             'user_ip': user_ip,
                             'stw_codes': stw_codes,
@@ -425,9 +424,8 @@ async def auto_refresh_session(session_id):
             session = active_sessions.get(session_id)
             if not session: break
         
-        # --- Proactively refresh the core access token if it's about to expire ---
-        # Check if the access token expires in the next 10 minutes
-        if time.time() > session['access_token_expires_at'] - 600:
+        # Proactively refresh the core access token if it's about to expire
+        if time.time() > session['access_token_expires_at'] - 600: # 10-minute buffer
             logger.info(f"[{session_id}] Core access token is expiring. Attempting to refresh...")
             new_token_data = await refresh_access_token(session['refresh_token'])
             
@@ -438,24 +436,21 @@ async def auto_refresh_session(session_id):
                             'access_token': new_token_data['access_token'],
                             'access_token_expires_at': time.time() + new_token_data['expires_in'],
                             'refresh_token': new_token_data['refresh_token'],
-                            'refresh_token_expires_at': time.time() + new_token_data['refresh_expires_in'],
                             'core_token_refresh_count': session['core_token_refresh_count'] + 1
                         })
-                        # Update local session variable for the current loop iteration
                         session = active_sessions[session_id]
                 logger.info(f"[{session_id}] ✅ Core access token has been successfully refreshed.")
             else:
                 logger.error(f"[{session_id}] ❌ FATAL: Could not refresh core access token. Session will now terminate.")
-                break # Terminate the loop if the core token cannot be refreshed
+                break 
 
-        # --- Refresh the short-lived exchange code ---
+        # Refresh the short-lived exchange code
         new_exchange_code = await get_exchange_code(session['access_token'])
         if new_exchange_code:
             with session_lock:
                 if session_id in active_sessions:
                     active_sessions[session_id]['exchange_refresh_count'] += 1
             
-            # Log exchange code refresh separately from the more critical core token refresh
             logger.info(f"[{session_id}] ✅ Exchange code refreshed for {display_name} (Refresh #{session['exchange_refresh_count']})")
             await send_or_update_embed(session_id, new_exchange_code)
         else:
