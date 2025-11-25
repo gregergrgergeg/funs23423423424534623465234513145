@@ -1,4 +1,2 @@
-discord.py
-aiohttp
 requests
-PyNaCl
+aiohttp
